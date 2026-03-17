@@ -104,9 +104,9 @@ def add_climatology(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_climate_indices(df: pd.DataFrame, indices_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join monthly AO, NAO, and ONI climate regime indices onto the feature table.
+    Join monthly climate regime indices onto the feature table.
 
-    indices_df: columns [year, month, ao_index, nao_index, oni]
+    indices_df: columns [year, month, ao_index, nao_index, oni, pna_index, pdo_index]
     Rows in df without a matching (year, month) get NaN, which the model
     imputes with global medians.
     """
@@ -114,11 +114,30 @@ def add_climate_indices(df: pd.DataFrame, indices_df: pd.DataFrame) -> pd.DataFr
     df["_year"]  = pd.to_datetime(df["date"]).dt.year
     df["_month"] = pd.to_datetime(df["date"]).dt.month
     idx_cols = ["year", "month"] + [
-        c for c in ("ao_index", "nao_index", "oni") if c in indices_df.columns
+        c for c in ("ao_index", "nao_index", "oni", "pna_index", "pdo_index")
+        if c in indices_df.columns
     ]
     idx = indices_df[idx_cols].rename(columns={"year": "_year", "month": "_month"})
     df = df.merge(idx, on=["_year", "_month"], how="left")
     df = df.drop(columns=["_year", "_month"])
+    return df
+
+
+def add_mjo_indices(df: pd.DataFrame, mjo_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join daily MJO RMM amplitude and phase onto the feature table.
+
+    mjo_df: columns [date, mjo_amplitude, mjo_phase_sin, mjo_phase_cos]
+      mjo_amplitude > 1  → active MJO; < 1 → weak/neutral
+      mjo_phase_sin/cos  → cyclical encoding of MJO phase (1–8)
+
+    Dates before the BOM archive starts (Jun 1974) or any gaps get NaN,
+    which build_feature_table() imputes with zeros (neutral/inactive MJO).
+    """
+    df = df.copy()
+    mjo = mjo_df[["date", "mjo_amplitude", "mjo_phase_sin", "mjo_phase_cos"]].copy()
+    mjo["date"] = pd.to_datetime(mjo["date"])
+    df = df.merge(mjo, on="date", how="left")
     return df
 
 
@@ -128,6 +147,7 @@ def build_feature_table(
     gfs_df: pd.DataFrame = None,
     indices_df: pd.DataFrame = None,
     gefs_df: pd.DataFrame = None,
+    mjo_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Merge historical TMAX with forecast highs, then add all features.
@@ -136,8 +156,9 @@ def build_feature_table(
     forecast_df:   columns [city, forecast_high, target_date]  (NWS live forecast)
                    may also contain [nbm_high] if fetched alongside NWS
     gfs_df:        columns [date, city, forecast_high_gfs]     (OpenMeteo historical GFS)
-    indices_df:    columns [year, month, ao_index, oni]        (climate regime indices)
+    indices_df:    columns [year, month, ao_index, oni, ...]   (monthly climate regime indices)
     gefs_df:       columns [date, city, gefs_spread]           (GEFS ensemble member spread)
+    mjo_df:        columns [date, mjo_amplitude, mjo_phase_sin, mjo_phase_cos]  (daily MJO)
 
     forecast_high is set to (in priority order):
       1. NWS live forecast (forecast_df)  — used for today/tomorrow in live mode
@@ -240,9 +261,14 @@ def build_feature_table(
     if indices_df is not None:
         df = add_climate_indices(df, indices_df)
         # Impute with global median — indices don't vary by city
-        for col in ("ao_index", "nao_index", "oni"):
+        for col in ("ao_index", "nao_index", "oni", "pna_index", "pdo_index"):
             if col in df.columns:
                 df[col] = df[col].fillna(df[col].median())
+
+    # Ensure monthly indices exist even if indices_df was None
+    for col in ("ao_index", "nao_index", "oni", "pna_index", "pdo_index"):
+        if col not in df.columns:
+            df[col] = 0.0
 
     # NBM gridded max temperature.
     # Available from forecast_df (live mode); impute historical with forecast_high.
@@ -278,5 +304,15 @@ def build_feature_table(
     else:
         city_gefs_medians = df.groupby("city")["gefs_spread"].transform("median")
         df["gefs_spread"] = df["gefs_spread"].fillna(city_gefs_medians)
+
+    # MJO daily indices (amplitude + cyclical phase encoding).
+    # Impute with 0 = neutral/inactive MJO (physically correct for missing dates).
+    if mjo_df is not None:
+        df = add_mjo_indices(df, mjo_df)
+    for col in ("mjo_amplitude", "mjo_phase_sin", "mjo_phase_cos"):
+        if col not in df.columns:
+            df[col] = 0.0
+        else:
+            df[col] = df[col].fillna(0.0)
 
     return df

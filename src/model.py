@@ -67,6 +67,11 @@ FEATURES = [
     "ao_index",               # Arctic Oscillation — negative = cold-air-outbreak regime
     "nao_index",              # North Atlantic Oscillation — affects East Coast / Midwest temps
     "oni",                    # Oceanic Niño Index — positive = El Niño, negative = La Niña
+    "pna_index",              # Pacific/North American Pattern — positive = warm West / cold East
+    "pdo_index",              # Pacific Decadal Oscillation — modulates ENSO impact on US temps
+    "mjo_amplitude",          # MJO strength: sqrt(RMM1²+RMM2²); >1 = active oscillation
+    "mjo_phase_sin",          # sin(2π×(phase−1)/8) — cyclical MJO phase encoding
+    "mjo_phase_cos",          # cos(2π×(phase−1)/8) — cyclical MJO phase encoding
     "nbm_high",               # NBM gridded max temp (NWS /gridpoints); imputed from forecast_high when missing
     "gefs_spread",            # std of 31 GEFS ensemble members; imputed from ensemble_spread before Dec 2022
 ]

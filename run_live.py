@@ -38,6 +38,7 @@ from src.logger import log_trade, log_forecast, log_market_snapshot
 from src.noaa_forecast import get_forecasts_for_stations
 from src.ucb import CityUCB
 from src.live_data import fetch_live_openmeteo, fetch_live_gefs_spread, upsert_live
+from src.db import DB_PATH, get_db, read_df as db_read, check_freshness_db
 
 
 # ------------------------------------------------------------------
@@ -105,18 +106,60 @@ def main(dry_run: bool = True):
     print(f"Bankroll: ${BANKROLL:.2f}\n")
 
     # 1. Load data
-    if not HISTORY_FILE.exists():
-        print("ERROR: historical_tmax.csv not found. Run scripts/download_history.py first.")
-        sys.exit(1)
-
     stations = pd.read_csv(STATIONS_FILE)
-    hist     = pd.read_csv(HISTORY_FILE)
-    gfs_path = Path("data/forecasts/openmeteo_forecast_history.csv")
-    gfs_df   = pd.read_csv(gfs_path) if gfs_path.exists() else None
-    indices_path = Path("data/climate_indices.csv")
-    indices_df   = pd.read_csv(indices_path) if indices_path.exists() else None
-    gefs_path = Path("data/forecasts/gefs_spread.csv")
-    gefs_df   = pd.read_csv(gefs_path) if gefs_path.exists() else None
+
+    if DB_PATH.exists():
+        # ── Read from SQLite (primary path) ──────────────────────────────────
+        print(f"Reading from {DB_PATH}...")
+        with get_db() as conn:
+            hist       = db_read(conn, "weather_daily")
+            _gfs       = db_read(conn, "forecasts_daily")
+            _gefs      = db_read(conn, "gefs_spread")
+            _indices   = db_read(conn, "climate_monthly")
+            _mjo       = db_read(conn, "mjo_daily")
+            _ph        = pd.read_sql(
+                "SELECT DISTINCT series FROM kalshi_markets", conn
+            )
+        gfs_df     = _gfs     if not _gfs.empty     else None
+        gefs_df    = _gefs    if not _gefs.empty    else None
+        indices_df = _indices if not _indices.empty else None
+        mjo_df     = _mjo     if not _mjo.empty     else None
+        tradeable_series = set(_ph["series"].tolist()) if not _ph.empty else None
+    else:
+        # ── CSV fallback (before first migration) ─────────────────────────
+        if not HISTORY_FILE.exists():
+            print("ERROR: no data found. Run scripts/download_history.py "
+                  "then scripts/migrate_to_db.py.")
+            sys.exit(1)
+        print("DB not found — reading from CSVs (run scripts/migrate_to_db.py to migrate).")
+        hist = pd.read_csv(HISTORY_FILE)
+        gfs_path   = Path("data/forecasts/openmeteo_forecast_history.csv")
+        gefs_path  = Path("data/forecasts/gefs_spread.csv")
+        indices_path = Path("data/climate_indices.csv")
+        mjo_path   = Path("data/mjo_indices.csv")
+        gfs_df     = pd.read_csv(gfs_path)     if gfs_path.exists()     else None
+        gefs_df    = pd.read_csv(gefs_path)    if gefs_path.exists()    else None
+        indices_df = pd.read_csv(indices_path) if indices_path.exists() else None
+        mjo_df     = pd.read_csv(mjo_path)     if mjo_path.exists()     else None
+        price_history_path = Path("data/kalshi_price_history.csv")
+        if price_history_path.exists():
+            ph = pd.read_csv(price_history_path, usecols=["series"])
+            tradeable_series = set(ph["series"].unique())
+        else:
+            tradeable_series = None
+
+    # Restrict trading to cities with Kalshi price history
+    if tradeable_series is not None:
+        tradeable_stations = stations[
+            stations["kalshi_series"].isin(tradeable_series)
+        ].copy()
+        skipped = set(stations["kalshi_series"]) - tradeable_series
+        print(f"Tradeable cities: {len(tradeable_stations)}/{len(stations)} "
+              f"(skipping {len(skipped)} without price history)")
+    else:
+        tradeable_stations = stations.copy()
+        print("Warning: no Kalshi price history — trading all cities (no history filter)")
+
     print(f"Loaded {len(hist)} historical rows for {hist['city'].nunique()} cities.")
     if gfs_df is not None:
         print(f"Loaded {len(gfs_df)} GFS forecast rows.")
@@ -124,6 +167,16 @@ def main(dry_run: bool = True):
         print(f"Loaded {len(indices_df)} climate index rows.")
     if gefs_df is not None:
         print(f"Loaded {len(gefs_df)} GEFS spread rows.")
+    if mjo_df is not None:
+        print(f"Loaded {len(mjo_df)} MJO index rows.")
+
+    # 1b. Freshness check — warn if any data source is stale
+    print("\n--- Data freshness ---")
+    if DB_PATH.exists():
+        with get_db() as conn:
+            for r in check_freshness_db(conn):
+                print(r.summary())
+    print()
 
     # 2. Refresh with latest model runs from OpenMeteo live APIs
     # GFS/ECMWF/ICON updates 4x/day; GEFS ensemble spread updates 4x/day.
@@ -161,7 +214,7 @@ def main(dry_run: bool = True):
 
     # 4. Build features — GFS fills historical forecast_high; NWS/NBM covers today/tomorrow
     df = build_feature_table(hist, forecast_df, gfs_df=gfs_df, indices_df=indices_df,
-                             gefs_df=gefs_df)
+                             gefs_df=gefs_df, mjo_df=mjo_df)
     df["forecast_high"] = df["forecast_high"].fillna(df["climo_mean_doy"])
     df["forecast_minus_climo"] = df["forecast_high"] - df["climo_mean_doy"]
 
@@ -242,11 +295,11 @@ def main(dry_run: bool = True):
         sys.exit(1)
 
     print(f"Fetching weather markets for {TARGET_DATE}...")
-    weather_markets = fetch_weather_markets(auth, stations, TARGET_DATE)
+    weather_markets = fetch_weather_markets(auth, tradeable_stations, TARGET_DATE)
     print(f"  {len(weather_markets)} total markets to evaluate.\n")
 
     # Load UCB city allocation state
-    city_ucb = CityUCB(cities=stations["city"].tolist())
+    city_ucb = CityUCB(cities=tradeable_stations["city"].tolist())
     city_ucb.load_state()
     backtest_trades_path = Path("logs/pnl_backtest_trades.csv")
     if backtest_trades_path.exists():
@@ -259,7 +312,18 @@ def main(dry_run: bool = True):
         print(f"  {city_name:20s}  n={info['n']:4d}  mean_reward={info['mean_reward']:+.3f}  mult={info['multiplier']:.2f}x")
     print()
 
-    # 8. Evaluate each market
+    # 8. Fetch current positions so we only trade the delta on each loop iteration.
+    # Kalshi "position" is net yes contracts: positive = long yes, negative = long no.
+    # Without this, looping every 30 min would stack a full new Kelly position each time.
+    try:
+        raw_positions = kalshi.get_positions()
+        positions = {p["ticker"]: p.get("position", 0) for p in raw_positions}
+        print(f"Fetched {len(positions)} open positions.")
+    except Exception as e:
+        print(f"Warning: could not fetch positions ({e}) — assuming no open positions.")
+        positions = {}
+
+    # 9. Evaluate each market
     all_recommendations = []
 
     for market in weather_markets:
@@ -288,12 +352,20 @@ def main(dry_run: bool = True):
         )
 
         for trade in trades:
+            side = trade["side"]
+            target = trade["contract_count"]
+            net_pos = positions.get(ticker, 0)
+            held = max(0, net_pos) if side == "yes" else max(0, -net_pos)
+            delta = max(0.0, target - held)
+            trade["delta_contracts"] = round(delta, 4)
+            trade["held_contracts"]  = round(held, 4)
+
             print(
                 f"  [{city}] {ticker}\n"
                 f"    title:  {market.get('title')}\n"
                 f"    fair_p={trade['fair_p']:.3f}  ask={trade['price_dollars']:.2f}"
-                f"  edge={trade['edge']:.3f}  side={trade['side']}"
-                f"  size=${trade['dollar_size']:.2f} ({trade['contract_count']:.2f} contracts)"
+                f"  edge={trade['edge']:.3f}  side={side}"
+                f"  target={target:.2f}  held={held:.2f}  delta={delta:.2f}"
             )
 
             log_trade(
@@ -304,13 +376,13 @@ def main(dry_run: bool = True):
                 fair_p=trade["fair_p"],
                 yes_ask=market.get("yes_ask_dollars") or 0,
                 no_ask=market.get("no_ask_dollars") or 0,
-                edge_yes=trade["edge"] if trade["side"] == "yes" else 0,
-                edge_no=trade["edge"] if trade["side"] == "no" else 0,
+                edge_yes=trade["edge"] if side == "yes" else 0,
+                edge_no=trade["edge"] if side == "no" else 0,
                 action="recommend" if dry_run else "place",
-                side=trade["side"],
+                side=side,
                 size_dollars=trade["dollar_size"],
-                contract_count=trade["contract_count"],
-                status="dry_run" if dry_run else "pending",
+                contract_count=delta,
+                status="dry_run" if dry_run else ("skip" if delta <= 0 else "pending"),
             )
 
             all_recommendations.append(trade)
@@ -318,22 +390,28 @@ def main(dry_run: bool = True):
         if not trades:
             print(f"  [{city}] {ticker}: no edge  (fair={compute_fair_for_log(market, pred_rows[city])})")
 
-    # 8. Place orders (live mode only)
+    # 10. Place orders (live mode only) — only the delta needed to reach Kelly target
     if not dry_run and all_recommendations:
-        print(f"\nPlacing {len(all_recommendations)} orders...")
-        for trade in all_recommendations:
+        actionable = [t for t in all_recommendations if t["delta_contracts"] > 0]
+        skipped    = len(all_recommendations) - len(actionable)
+        if skipped:
+            print(f"\n{skipped} market(s) already at/above Kelly target — skipping.")
+        print(f"Placing {len(actionable)} orders...")
+        for trade in actionable:
             try:
                 resp = kalshi.place_order(
                     ticker=trade["ticker"],
                     side=trade["side"],
-                    count=max(1, round(trade["contract_count"])),
+                    count=max(1, round(trade["delta_contracts"])),
                     price=int(round(trade["price_dollars"] * 100)),
                 )
                 print(f"  Order placed: {resp}")
             except Exception as e:
                 print(f"  Order failed for {trade['ticker']}: {e}")
     else:
-        print(f"\nDry run complete: {len(all_recommendations)} recommendations logged.")
+        actionable = [t for t in all_recommendations if t["delta_contracts"] > 0]
+        print(f"\nDry run complete: {len(actionable)} new / "
+              f"{len(all_recommendations) - len(actionable)} already positioned.")
 
     print("Done.")
 

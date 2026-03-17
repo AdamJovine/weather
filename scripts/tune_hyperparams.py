@@ -1,24 +1,37 @@
 """
 Bayesian Hyperparameter Optimization for weather temperature models.
 
-Gaussian Process surrogate + Expected Improvement (EI) acquisition.
-Objective: walk-forward ROI (same setup as compare_models.py).
+Objective: walk-forward ROI evaluated by BacktestEngine against real Kalshi
+historical prices. Every trial is exactly as principled as a real backtest —
+no synthetic prices, no subsampled rows.
+
+For speed during tuning, trials use:
+  --refit-every  14    (bi-weekly model refits instead of daily)
+  --sessions-per-day 1 (first hourly snapshot per day only)
+
+These can be loosened with --refit-every 1 --sessions-per-day 0 for a
+higher-fidelity (slower) objective.
+
+Prerequisites:
+    python scripts/download_kalshi_history.py   # real price history
 
 Usage:
-  python scripts/tune_hyperparams.py                        # BayesianRidge, 25 evals
-  python scripts/tune_hyperparams.py --model NGBoost --n-iter 30
-  python scripts/tune_hyperparams.py --model all            # tune all models sequentially
-  python scripts/tune_hyperparams.py --list                 # list available models
+    python scripts/tune_hyperparams.py --model GBResidual
+    python scripts/tune_hyperparams.py --model NGBoost --n-iter 30
+    python scripts/tune_hyperparams.py --model all             # all models sequentially
+    python scripts/tune_hyperparams.py --list                  # list models + their params
 
-Available models: BayesianRidge, ARD, NGBoost, RandomForest, ExtraTrees,
-                  QuantileGB, GBResidual, BaggingRidge, KernelRidge
+Available models:
+    ARD, BaggingRidge, BayesianRidge, ExtraTrees, GBResidual,
+    InteractionBayes, KernelRidge, NGBoost, QuantileGB, RandomForest
 """
 
 import sys
 import argparse
-import time
 import json
+import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,107 +42,117 @@ from scipy.stats import norm as sp_norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 
-from src.features import build_feature_table
-from src.config import TRADE_FEE_BUFFER, TRADE_MODEL_BUFFER
+from backtesting.config import BacktestConfig
+from backtesting.data_loader import DataLoader
+from backtesting.engine import BacktestEngine
+from backtesting.market_data import KalshiPriceStore
+from backtesting.results import RunResult
 
 warnings.filterwarnings("ignore")
 
-# ------------------------------------------------------------------
-# Backtest parameters (mirrors compare_models.py for comparability)
-# ------------------------------------------------------------------
-EDGE_THRESHOLD    = TRADE_FEE_BUFFER + TRADE_MODEL_BUFFER
-BANKROLL_START    = 500.0
-THRESHOLD_OFFSETS = [-12, -9, -6, -3, 0, 3, 6, 9, 12]
-MIN_TRAIN_ROWS    = 365
-MKT_SPREAD_ALPHA  = 0.3     # market sigma scaling; fixed, not tuned here
-N_THOMPSON_DRAWS  = 30
-EVAL_STEP         = 20      # evaluate every Nth row in walk-forward
 
-# ------------------------------------------------------------------
-# Hyperparameter search spaces
-# Each param tuple: (name, scale, low, high)
-#   "log"    → GP operates on log10(value); low/high are raw values
-#   "linear" → GP operates on value directly
-#   "int"    → integer linear; rounded when decoding
-# ------------------------------------------------------------------
-# Shared params appended to every model's search space.
-# Training: how much history and how to weight it.
-#   lookback       – rows of training history to keep (2500 ≈ no limit)
-#   decay_halflife – exp recency weighting: weight ∝ exp(-ln2/h * age_days)
-#                    720 ≈ uniform; ignored for BayesianRidge/ARD/KernelRidge
-#                    (those estimators don't support sample_weight)
-# Trading: bet sizing and contract selectivity.
-#   min_p_sel – fraction of Thompson draws that must agree before betting
-#   min_edge  – extra edge buffer on top of base EDGE_THRESHOLD
+# ── Tuning-run settings (fixed across all trials) ────────────────────────────
+
+@dataclass
+class TuneConfig:
+    """
+    Backtest settings that are fixed for all BO trials — not themselves tuned.
+
+    refit_every and sessions_per_day control the speed/fidelity tradeoff:
+      faster  → refit_every=14, sessions_per_day=1
+      slower  → refit_every=1,  sessions_per_day=0 (all candles)
+    """
+    start_date: str = "2022-01-01"
+    end_date: str = "2024-12-31"
+    refit_every: int = 14       # model refit cadence in calendar days
+    sessions_per_day: int = 1   # 1 = first candle per day; 0 = all candles
+    max_daily_trades: int = 4
+    max_session_trades: int = 4
+    min_train_rows: int = 365
+
+
+# ── Hyperparameter search spaces ──────────────────────────────────────────────
+# Each entry: (param_name, scale, low, high)
+#   "log"    → GP operates on log10(value)
+#   "linear" → GP operates on raw value
+#   "int"    → integer; rounded when decoding from unit hypercube
+
 _SHARED_PARAMS = [
-    ("lookback",       "int",     180, 2500),
-    ("decay_halflife", "int",      20,  720),
-    ("kelly_fraction", "linear",  0.05,  1.0),
-    ("max_bet_frac",   "linear",  0.01,  0.20),
-    ("min_p_sel",      "linear",  0.05,  0.80),
-    ("min_edge",       "linear",  0.0,   0.15),
+    # Training
+    ("lookback",       "int",    180, 2500),   # rows of history to train on
+    # Sizing
+    ("kelly_fraction", "linear", 0.05,  1.0),
+    ("max_bet_frac",   "linear", 0.01,  0.20),
+    # Edge
+    ("min_edge",       "linear", 0.00,  0.15),
+    # Uncertainty — widens model's predictive sigma on high-spread days
+    ("spread_alpha",   "linear", 0.00,  1.00),
 ]
 
 SEARCH_SPACES = {
     "BayesianRidge": [
-        ("alpha_1",      "log",    1e-8,  1e-2),
-        ("alpha_2",      "log",    1e-8,  1e-2),
-        ("lambda_1",     "log",    1e-8,  1e-2),
-        ("lambda_2",     "log",    1e-8,  1e-2),
-        ("spread_alpha", "linear", 0.0,   1.0),
+        ("alpha_1",  "log", 1e-8, 1e-2),
+        ("alpha_2",  "log", 1e-8, 1e-2),
+        ("lambda_1", "log", 1e-8, 1e-2),
+        ("lambda_2", "log", 1e-8, 1e-2),
     ] + _SHARED_PARAMS,
+
     "ARD": [
-        ("alpha_1",      "log",    1e-8,  1e-2),
-        ("alpha_2",      "log",    1e-8,  1e-2),
-        ("lambda_1",     "log",    1e-8,  1e-2),
-        ("lambda_2",     "log",    1e-8,  1e-2),
-        ("spread_alpha", "linear", 0.0,   1.0),
+        ("alpha_1",  "log", 1e-8, 1e-2),
+        ("alpha_2",  "log", 1e-8, 1e-2),
+        ("lambda_1", "log", 1e-8, 1e-2),
+        ("lambda_2", "log", 1e-8, 1e-2),
     ] + _SHARED_PARAMS,
+
+    "InteractionBayes": [
+        ("alpha_1",  "log", 1e-8, 1e-2),
+        ("alpha_2",  "log", 1e-8, 1e-2),
+        ("lambda_1", "log", 1e-8, 1e-2),
+        ("lambda_2", "log", 1e-8, 1e-2),
+    ] + _SHARED_PARAMS,
+
     "NGBoost": [
-        ("n_estimators",   "int",    50,   400),
-        ("learning_rate",  "log",  0.01,   0.3),
-        ("epistemic_frac", "linear",0.05,  0.5),
-        ("spread_alpha",   "linear",0.0,   1.0),
+        ("n_estimators",   "int",     50,  400),
+        ("learning_rate",  "log",   0.01,  0.3),
+        ("epistemic_frac", "linear", 0.05, 0.5),
     ] + _SHARED_PARAMS,
+
     "RandomForest": [
-        ("n_estimators", "int",    20,  200),
-        ("max_depth",    "int",     3,   15),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("n_estimators", "int",  20, 200),
+        ("max_depth",    "int",   3,  15),
     ] + _SHARED_PARAMS,
+
     "ExtraTrees": [
-        ("n_estimators", "int",    20,  200),
-        ("max_depth",    "int",     3,   15),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("n_estimators", "int",  20, 200),
+        ("max_depth",    "int",   3,  15),
     ] + _SHARED_PARAMS,
+
     "QuantileGB": [
-        ("max_iter",     "int",    30,  300),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("max_iter", "int", 30, 300),
     ] + _SHARED_PARAMS,
+
     "GBResidual": [
-        ("n_estimators", "int",    30,  300),
-        ("max_depth",    "int",     2,    8),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("n_estimators", "int",  30, 300),
+        ("max_depth",    "int",   2,   8),
     ] + _SHARED_PARAMS,
+
     "BaggingRidge": [
-        ("n_estimators", "int",    10,  100),
-        ("ridge_alpha",  "log",  0.01, 100.0),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("n_estimators", "int",   10, 100),
+        ("ridge_alpha",  "log", 0.01, 100.0),
     ] + _SHARED_PARAMS,
+
     "KernelRidge": [
-        ("alpha",        "log",  0.01,  10.0),
-        ("gamma",        "log", 0.001,   1.0),
-        ("n_boot",       "int",     5,    30),
-        ("spread_alpha", "linear", 0.0,  1.0),
+        ("alpha", "log",  0.01, 10.0),
+        ("gamma", "log", 0.001,  1.0),
+        ("n_boot", "int",    5,   30),
     ] + _SHARED_PARAMS,
 }
 
 
-# ------------------------------------------------------------------
-# Param space encode / decode  (maps params ↔ [0,1]^d for GP)
-# ------------------------------------------------------------------
+# ── Param space encode / decode ───────────────────────────────────────────────
 
 def encode(params: dict, space: list) -> np.ndarray:
-    """Map a params dict to a unit-hypercube point."""
+    """Map a params dict to a point in [0, 1]^d."""
     x = []
     for name, scale, lo, hi in space:
         v = params[name]
@@ -141,7 +164,7 @@ def encode(params: dict, space: list) -> np.ndarray:
 
 
 def decode(x: np.ndarray, space: list) -> dict:
-    """Map a unit-hypercube point back to a params dict."""
+    """Map a point in [0, 1]^d back to a params dict."""
     params = {}
     for xi, (name, scale, lo, hi) in zip(x, space):
         xi = float(np.clip(xi, 0.0, 1.0))
@@ -156,7 +179,7 @@ def decode(x: np.ndarray, space: list) -> dict:
 
 
 def latin_hypercube(n: int, d: int, rng: np.random.Generator) -> np.ndarray:
-    """Latin-hypercube samples in [0,1]^d."""
+    """Latin-hypercube samples in [0, 1]^d."""
     pts = np.zeros((n, d))
     for j in range(d):
         perm = rng.permutation(n)
@@ -164,9 +187,7 @@ def latin_hypercube(n: int, d: int, rng: np.random.Generator) -> np.ndarray:
     return pts
 
 
-# ------------------------------------------------------------------
-# Expected Improvement acquisition
-# ------------------------------------------------------------------
+# ── Expected Improvement acquisition ──────────────────────────────────────────
 
 def expected_improvement(
     X_cand: np.ndarray,
@@ -184,80 +205,37 @@ def expected_improvement(
     return ei
 
 
-# ------------------------------------------------------------------
-# Shared backtest helpers (same logic as compare_models.py)
-# ------------------------------------------------------------------
-
-def climo_prob_geq(threshold, climo_mean, climo_sigma, spread=0.0):
-    market_sigma = climo_sigma * (1.0 + MKT_SPREAD_ALPHA * spread)
-    return float(sp_norm.sf(threshold - 0.5, loc=climo_mean, scale=market_sigma))
-
-
-def kelly_size(edge, bankroll, kelly_fraction, max_bet_frac):
-    if edge <= 0:
-        return 0.0
-    return min(bankroll * max_bet_frac, bankroll * edge * kelly_fraction)
-
-
-def thompson_select(mu_hat, epistemic_std, aleatoric, thresholds, mkt_prices):
-    mu_draws    = np.random.normal(mu_hat, max(epistemic_std, 0.01), N_THOMPSON_DRAWS)
-    total_sigma = float(np.sqrt(epistemic_std**2 + aleatoric**2))
-    counts: dict = {}
-
-    for mu_s in mu_draws:
-        best_edge, best_key = EDGE_THRESHOLD, None
-        for threshold, mkt_p in zip(thresholds, mkt_prices):
-            model_p  = float(sp_norm.sf(threshold - 0.5, loc=mu_s, scale=aleatoric))
-            yes_edge = model_p - mkt_p
-            no_edge  = mkt_p - model_p
-            if yes_edge > best_edge and model_p <= 0.90:
-                best_edge, best_key = yes_edge, (threshold, "yes")
-            if no_edge > best_edge and (1 - model_p) <= 0.90:
-                best_edge, best_key = no_edge, (threshold, "no")
-        if best_key:
-            counts[best_key] = counts.get(best_key, 0) + 1
-
-    if not counts:
-        return []
-
-    trades = []
-    for (threshold, side), count in counts.items():
-        p_sel       = count / N_THOMPSON_DRAWS
-        mkt_p       = mkt_prices[thresholds.index(threshold)]
-        exp_model_p = float(sp_norm.sf(threshold - 0.5, loc=mu_hat, scale=total_sigma))
-        exp_edge    = (exp_model_p - mkt_p) if side == "yes" else (mkt_p - exp_model_p)
-        if p_sel > 0.80 and exp_edge < 0.10:
-            continue
-        if exp_edge > 0:
-            trades.append({"threshold": threshold, "side": side,
-                           "mkt_p": mkt_p, "exp_edge": exp_edge,
-                           "p_sel": p_sel, "ei": p_sel * exp_edge})
-    trades.sort(key=lambda x: -x["ei"])
-    return trades
-
-
-# ------------------------------------------------------------------
-# Model factory: build an instance with the trial's hyperparams.
-# spread_alpha is patched via monkeypatching src.model.SPREAD_ALPHA
-# (single-threaded, so safe to restore in a finally block).
-# ------------------------------------------------------------------
+# ── Model factory ─────────────────────────────────────────────────────────────
 
 def make_model(model_name: str, params: dict):
+    """
+    Instantiate a temperature model and inject trial-specific hyperparameters.
+    The returned instance is ready for .fit().
+
+    spread_alpha is NOT injected here — it is patched at the src.model module
+    level in evaluate_params() (single-threaded; always restored in finally).
+    """
     from src.model import (
-        BayesianTempModel, ARDTempModel, NGBoostTempModel,
-        RandomForestModel, ExtraTreesModel, QuantileGBModel,
-        GBResidualModel, BaggingRidgeModel, KernelRidgeModel,
+        BayesianTempModel, ARDTempModel, InteractionBayesModel,
+        NGBoostTempModel, RandomForestModel, ExtraTreesModel,
+        QuantileGBModel, GBResidualModel, BaggingRidgeModel, KernelRidgeModel,
     )
 
-    if model_name == "BayesianRidge":
-        from sklearn.linear_model import BayesianRidge
-        m = BayesianTempModel()
-        m._model = BayesianRidge(
+    if model_name in ("BayesianRidge", "InteractionBayes"):
+        from sklearn.linear_model import BayesianRidge as _BR
+        br = _BR(
             alpha_1=params.get("alpha_1", 1e-6),
             alpha_2=params.get("alpha_2", 1e-6),
             lambda_1=params.get("lambda_1", 1e-6),
             lambda_2=params.get("lambda_2", 1e-6),
         )
+        if model_name == "BayesianRidge":
+            m = BayesianTempModel()
+            m._model = br
+        else:
+            m = InteractionBayesModel()
+            # InteractionBayesModel uses a Pipeline; replace the last step
+            m._model.steps[-1] = ("bayesianridge", br)
 
     elif model_name == "ARD":
         from sklearn.linear_model import ARDRegression
@@ -317,157 +295,108 @@ def make_model(model_name: str, params: dict):
         m.N_BOOT = int(params.get("n_boot", 15))
 
     else:
-        raise ValueError(f"Unknown model: {model_name!r}. Use --list to see options.")
-
-    # Inject training params — read by _fit_core via getattr
-    m._lookback       = int(params.get("lookback",       0))
-    m._decay_halflife = float(params.get("decay_halflife", 0))
+        raise ValueError(f"Unknown model: {model_name!r}")
 
     return m
 
 
-# ------------------------------------------------------------------
-# Walk-forward evaluator: returns ROI for a given params dict
-# ------------------------------------------------------------------
+# ── Trial evaluator ───────────────────────────────────────────────────────────
 
 def evaluate_params(
     model_name: str,
     params: dict,
-    df: pd.DataFrame,
-    climo_sigma_map: dict,
-    return_trades: bool = False,
-) -> "float | tuple[float, pd.DataFrame]":
-    """Run walk-forward simulation; return ROI (or (ROI, trades_df) if return_trades=True).
-    Returns -1.0 on total failure."""
-    import src.model as _mmod
-    from src.model import FEATURES
+    dataset,
+    price_store: KalshiPriceStore,
+    tune_cfg: TuneConfig,
+    return_run: bool = False,
+) -> "tuple[float, dict] | tuple[float, dict, RunResult]":
+    """
+    Build a BacktestConfig from trial params, run one backtest via
+    BacktestEngine, and return (roi, per_year_roi_dict).
 
-    # Patch SPREAD_ALPHA for this trial (affects all models' _aleatoric)
+    spread_alpha is patched at the src.model module level so it affects
+    the model's aleatoric sigma computation. Always restored in finally.
+    """
+    import src.model as _mmod
     orig_spread = _mmod.SPREAD_ALPHA
     _mmod.SPREAD_ALPHA = float(params.get("spread_alpha", orig_spread))
 
-    all_trades = []
     try:
-        for city in df["city"].unique():
-            city_df     = df[df["city"] == city].copy().reset_index(drop=True)
-            climo_sigma = climo_sigma_map.get(city, 10.0)
-
-            for i in range(MIN_TRAIN_ROWS, len(city_df), EVAL_STEP):
-                test_row = city_df.iloc[i]
-                if pd.isna(test_row["y_tmax"]):
-                    continue
-                if city_df.iloc[[i]][FEATURES].isnull().any(axis=1).iloc[0]:
-                    continue
-
-                train_df = city_df.iloc[:i]
-                model    = make_model(model_name, params)
-                try:
-                    model.fit(train_df)
-                    mu_arr, ep_arr, al_arr = model.predict_with_uncertainty(city_df.iloc[[i]])
-                except Exception:
-                    continue
-
-                mu_hat        = float(mu_arr[0])
-                epistemic_std = float(ep_arr[0])
-                aleatoric     = float(al_arr[0])
-                spread_val    = float(test_row.get("ensemble_spread", 0) or 0)
-                y_tmax        = float(test_row["y_tmax"])
-                climo_mean    = float(test_row["climo_mean_doy"])
-
-                thresholds = [int(round(climo_mean + off)) for off in THRESHOLD_OFFSETS]
-                mkt_prices = [
-                    climo_prob_geq(t, climo_mean, climo_sigma, spread_val)
-                    for t in thresholds
-                ]
-
-                candidates = thompson_select(mu_hat, epistemic_std, aleatoric, thresholds, mkt_prices)
-                kf       = params.get("kelly_fraction", 0.25)
-                mbf      = params.get("max_bet_frac",   0.05)
-                min_psel = params.get("min_p_sel",      0.0)
-                min_edge = EDGE_THRESHOLD + params.get("min_edge", 0.0)
-                for trade_info in candidates[:1]:
-                    if trade_info["p_sel"] < min_psel:
-                        continue
-                    if trade_info["exp_edge"] < min_edge:
-                        continue
-                    side    = trade_info["side"]
-                    mkt_p   = trade_info["mkt_p"]
-                    edge    = trade_info["exp_edge"]
-                    outcome = 1 if y_tmax >= trade_info["threshold"] else 0
-                    size    = kelly_size(edge, BANKROLL_START, kf, mbf)
-                    pnl     = (
-                        size * (outcome - mkt_p)
-                        if side == "yes"
-                        else size * ((1 - outcome) - (1 - mkt_p))
-                    )
-                    trade = {
-                        "year": pd.to_datetime(test_row["date"]).year,
-                        "size": size,
-                        "pnl":  pnl,
-                    }
-                    if return_trades:
-                        trade.update({
-                            "date":      test_row["date"],
-                            "city":      city,
-                            "threshold": trade_info["threshold"],
-                            "side":      side,
-                            "mkt_p":     mkt_p,
-                            "edge":      edge,
-                            "p_sel":     trade_info["p_sel"],
-                            "ei":        trade_info["ei"],
-                            "mu_hat":    mu_hat,
-                            "outcome":   outcome if side == "yes" else 1 - outcome,
-                        })
-                    all_trades.append(trade)
-
+        cfg = BacktestConfig(
+            model_name=model_name,
+            lookback=int(params.get("lookback", 730)),
+            kelly_fraction=float(params.get("kelly_fraction", 0.33)),
+            max_bet_fraction=float(params.get("max_bet_frac", 0.05)),
+            min_edge=float(params.get("min_edge", 0.05)),
+            n_runs=1,
+            seed=42,
+            start_date=tune_cfg.start_date,
+            end_date=tune_cfg.end_date,
+            sessions_per_day=tune_cfg.sessions_per_day,
+            max_daily_trades=tune_cfg.max_daily_trades,
+            max_session_trades=tune_cfg.max_session_trades,
+            refit_every=tune_cfg.refit_every,
+            min_train_rows=tune_cfg.min_train_rows,
+            verbose=False,
+        )
+        # Capture params in a local so the lambda closure is stable
+        _params = dict(params)
+        engine = BacktestEngine(
+            dataset,
+            cfg,
+            price_store,
+            model_factory=lambda: make_model(model_name, _params),
+        )
+        results = engine.run()
+    except Exception:
+        empty = ({},)
+        return (-1.0, *empty, None) if return_run else (-1.0, {})
     finally:
         _mmod.SPREAD_ALPHA = orig_spread
 
-    if not all_trades:
-        return (-1.0, {}, pd.DataFrame()) if return_trades else (-1.0, {})
-    tdf           = pd.DataFrame(all_trades)
-    total_wagered = tdf["size"].sum()
-    roi           = float(tdf["pnl"].sum() / total_wagered) if total_wagered > 0 else -1.0
+    run = results.runs[0]
+    year_rois = _year_rois(run.trades)
+    if return_run:
+        return run.roi, year_rois, run
+    return run.roi, year_rois
 
-    # Per-year ROI breakdown
-    year_rois = {}
-    for yr, grp in tdf.groupby("year"):
+
+def _year_rois(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {}
+    trades = trades.copy()
+    trades["year"] = pd.to_datetime(trades["date"]).dt.year
+    result = {}
+    for yr, grp in trades.groupby("year"):
         w = grp["size"].sum()
-        year_rois[int(yr)] = float(grp["pnl"].sum() / w) if w > 0 else 0.0
-
-    if return_trades:
-        tdf["date"] = pd.to_datetime(tdf["date"])
-        tdf = tdf.sort_values("date").reset_index(drop=True)
-        return roi, year_rois, tdf
-    return roi, year_rois
+        result[int(yr)] = float(grp["pnl"].sum() / w) if w > 0 else 0.0
+    return result
 
 
-# ------------------------------------------------------------------
-# Bayesian Optimization loop
-# ------------------------------------------------------------------
+# ── Bayesian Optimization loop ────────────────────────────────────────────────
 
 def run_bo(
     model_name: str,
-    df: pd.DataFrame,
-    climo_sigma_map: dict,
-    n_iter: int = 25,
-    n_init: int = 5,
+    dataset,
+    price_store: KalshiPriceStore,
+    tune_cfg: TuneConfig,
+    n_iter: int = 50,
+    n_init: int = 10,
     xi: float = 0.01,
     seed: int = 0,
 ) -> dict:
     """
-    Run BO for `model_name`.  Returns a dict with keys:
-        best_params, best_roi, history (list of {params, roi} dicts)
+    Run Bayesian Optimization for model_name.
+    Returns dict: {best_params, best_roi, history}.
     """
     space = SEARCH_SPACES[model_name]
-    d     = len(space)
-    rng   = np.random.default_rng(seed)
+    d = len(space)
+    rng = np.random.default_rng(seed)
 
-    # GP surrogate: Matérn 5/2 kernel + noise
     kernel = Matern(nu=2.5, length_scale=np.ones(d), length_scale_bounds=(1e-3, 10.0))
-    gp     = GaussianProcessRegressor(
+    gp = GaussianProcessRegressor(
         kernel=kernel,
-        alpha=1e-3,          # observation noise
+        alpha=1e-3,
         normalize_y=True,
         n_restarts_optimizer=5,
     )
@@ -476,31 +405,34 @@ def run_bo(
     y_obs = np.full(n_init, np.nan)
     history = []
 
-    print(f"\n{'='*60}")
-    print(f"Tuning: {model_name}  |  {n_iter} total evals  ({n_init} random init)")
-    print(f"{'='*60}")
-    param_names = [s[0] for s in space]
+    sep = "=" * 64
+    print(f"\n{sep}")
+    print(f"Tuning: {model_name}  |  {n_iter} evals  ({n_init} random init)")
+    print(
+        f"Period: {tune_cfg.start_date} → {tune_cfg.end_date}  |  "
+        f"refit_every={tune_cfg.refit_every}d  |  "
+        f"sessions/day={'all' if tune_cfg.sessions_per_day == 0 else tune_cfg.sessions_per_day}"
+    )
+    print(sep)
     print(f"{'iter':>4}  {'roi':>8}  {'best':>8}  params")
-    print("-" * 60)
+    print("-" * 64)
 
     for it in range(n_iter):
         if it < n_init:
             x_next = X_obs[it]
         else:
-            # Fit GP on valid observations
-            mask   = np.isfinite(y_obs)
+            mask = np.isfinite(y_obs)
             if mask.sum() >= 2:
                 gp.fit(X_obs[mask], y_obs[mask])
-                # Sample 8000 candidates; pick argmax EI
                 X_cand = rng.uniform(size=(8000, d))
-                ei     = expected_improvement(X_cand, y_obs[mask], gp, xi=xi)
+                ei = expected_improvement(X_cand, y_obs[mask], gp, xi=xi)
                 x_next = X_cand[np.argmax(ei)]
             else:
                 x_next = rng.uniform(size=d)
 
         params = decode(x_next, space)
-        t0     = time.time()
-        roi, year_rois = evaluate_params(model_name, params, df, climo_sigma_map)
+        t0 = time.time()
+        roi, year_rois = evaluate_params(model_name, params, dataset, price_store, tune_cfg)
         elapsed = time.time() - t0
 
         if it >= n_init:
@@ -510,108 +442,118 @@ def run_bo(
             y_obs[it] = roi
 
         history.append({"params": params, "roi": roi})
-        best_roi   = np.nanmax(y_obs)
+        best_roi = float(np.nanmax(y_obs))
         params_str = "  ".join(f"{k}={v:.4g}" for k, v in params.items())
-        yr_vals   = list(year_rois.values())
-        yr_by_yr  = "  ".join(f"{yr}:{r:.3f}" for yr, r in sorted(year_rois.items()))
         print(f"{it+1:>4}  {roi:>8.4f}  {best_roi:>8.4f}  {params_str}  ({elapsed:.0f}s)")
-        print(f"      per-year ROI → {yr_by_yr}")
-        print(f"      year stats   → mean:{np.mean(yr_vals):.4f}  "
-              f"std:{np.std(yr_vals):.4f}  "
-              f"min:{np.min(yr_vals):.4f}  "
-              f"max:{np.max(yr_vals):.4f}")
 
-    best_idx    = int(np.nanargmax(y_obs))
+        if year_rois:
+            yr_vals = list(year_rois.values())
+            yr_str = "  ".join(f"{yr}:{r:.3f}" for yr, r in sorted(year_rois.items()))
+            print(
+                f"      per-year → {yr_str}  "
+                f"[mean:{np.mean(yr_vals):.3f}  "
+                f"std:{np.std(yr_vals):.3f}  "
+                f"min:{np.min(yr_vals):.3f}]"
+            )
+
+    best_idx = int(np.nanargmax(y_obs))
     best_params = history[best_idx]["params"]
-    best_roi    = history[best_idx]["roi"]
+    best_roi = history[best_idx]["roi"]
 
     print(f"\nBest ROI: {best_roi:.4f}")
     print("Best params:")
     for k, v in best_params.items():
-        print(f"  {k}: {v:.6g}")
+        print(f"  {k:<20} {v:.6g}")
 
-    valid_rois = np.array([r for r in y_obs if np.isfinite(r)])
-    print(f"\n=== ROI distribution across {len(valid_rois)} evals ===")
-    print(f"  mean:  {valid_rois.mean():.4f}")
-    print(f"  std:   {valid_rois.std():.4f}")
-    print(f"  min:   {valid_rois.min():.4f}")
-    for p in (25, 50, 75, 90):
-        print(f"  p{p:<3}:  {np.percentile(valid_rois, p):.4f}")
-    print(f"  max:   {valid_rois.max():.4f}")
-    print(f"  % > 0: {(valid_rois > 0).mean():.1%}")
+    valid = np.array([r for r in y_obs if np.isfinite(r)])
+    print(f"\n=== ROI distribution across {len(valid)} evals ===")
+    for label, p in [("min", 0), ("p25", 25), ("p50", 50), ("p75", 75), ("p90", 90), ("max", 100)]:
+        print(f"  {label}:  {np.percentile(valid, p):.4f}")
+    print(f"  mean:  {valid.mean():.4f}  |  std: {valid.std():.4f}  |  % > 0: {(valid > 0).mean():.1%}")
 
     return {"best_params": best_params, "best_roi": best_roi, "history": history}
 
 
-# ------------------------------------------------------------------
-# Data loading (shared across all model tuning runs)
-# ------------------------------------------------------------------
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-def load_data():
-    hist      = pd.read_csv("data/historical_tmax.csv")
-    gfs_path  = Path("data/forecasts/openmeteo_forecast_history.csv")
-    idx_path  = Path("data/climate_indices.csv")
-    gefs_path = Path("data/forecasts/gefs_spread.csv")
-
-    gfs_df  = pd.read_csv(gfs_path)  if gfs_path.exists()  else None
-    idx_df  = pd.read_csv(idx_path)  if idx_path.exists()  else None
-    gefs_df = pd.read_csv(gefs_path) if gefs_path.exists() else None
-
-    forecast_df = pd.DataFrame(columns=["city", "forecast_high", "target_date"])
-    df = build_feature_table(hist, forecast_df, gfs_df=gfs_df, indices_df=idx_df, gefs_df=gefs_df)
-    df["forecast_high"]        = df["forecast_high"].fillna(df["climo_mean_doy"])
-    df["forecast_minus_climo"] = df["forecast_high"] - df["climo_mean_doy"]
-
-    climo_sigma_map = {}
-    for city in df["city"].unique():
-        cdf = df[df["city"] == city].dropna(subset=["y_tmax", "climo_mean_doy"])
-        climo_sigma_map[city] = float((cdf["y_tmax"] - cdf["climo_mean_doy"]).std())
-
-    return df, climo_sigma_map
-
-
-# ------------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(description="Bayesian hyperparameter tuning for temperature models.")
-    parser.add_argument("--model",  default="BayesianRidge",
-                        help="Model to tune, or 'all' (default: BayesianRidge)")
-    parser.add_argument("--n-iter", type=int, default=50,
-                        help="Total evaluations including random init (default: 50)")
-    parser.add_argument("--n-init", type=int, default=10,
-                        help="Random initialization evals before BO starts (default: 10)")
-    parser.add_argument("--xi",     type=float, default=0.01,
-                        help="EI exploration bonus xi (default: 0.01)")
-    parser.add_argument("--seed",   type=int, default=0)
-    parser.add_argument("--list",   action="store_true",
-                        help="List available models and exit")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Bayesian hyperparameter tuning against real Kalshi market prices.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        default="BayesianRidge",
+        choices=sorted(SEARCH_SPACES.keys()) + ["all"],
+        metavar="MODEL",
+        help=(
+            "Model to tune. Choices: "
+            + ", ".join(sorted(SEARCH_SPACES.keys()))
+            + ", all  [default: BayesianRidge]"
+        ),
+    )
+    parser.add_argument("--n-iter",  type=int,   default=50,
+                        help="Total BO evaluations (including random init)")
+    parser.add_argument("--n-init",  type=int,   default=10,
+                        help="Random Latin-hypercube evals before BO starts")
+    parser.add_argument("--xi",      type=float, default=0.01,
+                        help="EI exploration bonus")
+    parser.add_argument("--seed",    type=int,   default=0)
+    parser.add_argument("--start",   default="2022-01-01",
+                        help="Backtest start date for tuning trials")
+    parser.add_argument("--end",     default="2024-12-31",
+                        help="Backtest end date for tuning trials")
+    parser.add_argument("--refit-every", type=int, default=14,
+                        help="Model refit cadence in days (larger = faster trials)")
+    parser.add_argument("--sessions-per-day", type=int, default=1,
+                        help="Price candles per day (1=fast, 0=all)")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="Skip data quality validation")
+    parser.add_argument("--list",    action="store_true",
+                        help="List models and their search spaces, then exit")
     args = parser.parse_args()
 
     if args.list:
-        print("Available models:")
+        print("Available models and their tunable parameters:\n")
         for name, space in SEARCH_SPACES.items():
-            param_str = ", ".join(s[0] for s in space)
-            print(f"  {name:<20} [{param_str}]")
+            print(f"  {name}")
+            for pname, scale, lo, hi in space:
+                print(f"    {pname:<20} {scale:<8} [{lo}, {hi}]")
         return
 
     models_to_run = list(SEARCH_SPACES.keys()) if args.model == "all" else [args.model]
     for m in models_to_run:
         if m not in SEARCH_SPACES:
-            print(f"Unknown model: {m!r}. Use --list to see options.")
+            print(f"Unknown model: {m!r}. Use --list.")
             sys.exit(1)
 
-    print("Loading data...")
-    df, climo_sigma_map = load_data()
-    print(f"Loaded {len(df)} rows across {df['city'].nunique()} cities.")
+    tune_cfg = TuneConfig(
+        start_date=args.start,
+        end_date=args.end,
+        refit_every=args.refit_every,
+        sessions_per_day=args.sessions_per_day,
+    )
+
+    # ── Load data once — shared across all trials and all models ──────────────
+    print("Loading Kalshi price history...")
+    price_store = KalshiPriceStore(data_dir="data").load()
+    print(price_store.coverage_summary())
+
+    print("\nLoading feature data...")
+    bootstrap_cfg = BacktestConfig(model_name="BayesianRidge",
+                                   start_date=tune_cfg.start_date,
+                                   end_date=tune_cfg.end_date)
+    dataset = DataLoader(data_dir="data").load(bootstrap_cfg, skip_validation=args.no_validate)
 
     Path("logs").mkdir(exist_ok=True)
     all_results = {}
 
     for model_name in models_to_run:
         result = run_bo(
-            model_name, df, climo_sigma_map,
+            model_name=model_name,
+            dataset=dataset,
+            price_store=price_store,
+            tune_cfg=tune_cfg,
             n_iter=args.n_iter,
             n_init=min(args.n_init, args.n_iter),
             xi=args.xi,
@@ -619,23 +561,26 @@ def main():
         )
         all_results[model_name] = {
             "best_params": result["best_params"],
-            "best_roi":    result["best_roi"],
+            "best_roi": result["best_roi"],
         }
 
-        # Save trade history for the best params so it can be inspected later
-        print(f"\nReplaying best params to save trade history...")
-        _, _, trades_df = evaluate_params(
-            model_name, result["best_params"], df, climo_sigma_map, return_trades=True
+        # Save trade log for the winning params
+        print(f"\nReplaying best params for {model_name}...")
+        roi, _, best_run = evaluate_params(
+            model_name, result["best_params"], dataset, price_store, tune_cfg,
+            return_run=True,
         )
-        if len(trades_df):
+        if best_run is not None and not best_run.trades.empty:
             trades_path = Path(f"logs/tuning_trades_{model_name}.csv")
-            trades_df.to_csv(trades_path, index=False)
-            win_rate = (trades_df["pnl"] > 0).mean()
-            print(f"Trade history saved to {trades_path}  "
-                  f"({len(trades_df)} trades, {win_rate:.1%} win rate)")
+            best_run.trades.to_csv(trades_path, index=False)
+            win_rate = (best_run.trades["pnl"] > 0).mean()
+            print(
+                f"  Trades → {trades_path}  "
+                f"({len(best_run.trades)} trades, {win_rate:.1%} win, ROI={roi:.4f})"
+            )
 
+    # Merge into the shared JSON (preserves results from previous tuning runs)
     out_path = Path("logs/tuned_hyperparams.json")
-    # Merge with any existing results
     existing = {}
     if out_path.exists():
         with open(out_path) as f:
@@ -643,12 +588,11 @@ def main():
     existing.update(all_results)
     with open(out_path, "w") as f:
         json.dump(existing, f, indent=2)
-    print(f"\nResults saved to {out_path}")
+    print(f"\nBest params → {out_path}")
 
     if len(models_to_run) > 1:
         print("\n=== Summary (ranked by ROI) ===")
-        rows = sorted(all_results.items(), key=lambda x: -x[1]["best_roi"])
-        for name, r in rows:
+        for name, r in sorted(all_results.items(), key=lambda x: -x[1]["best_roi"]):
             print(f"  {name:<20}  ROI={r['best_roi']:.4f}")
 
 

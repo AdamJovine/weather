@@ -9,6 +9,9 @@ logs/mega_tune/
 logs/backtest/
 logs/forecast_backtest/
 
+# Cache
+.cache/
+
 # Python
 __pycache__/
 *.pyc

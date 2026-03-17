@@ -194,6 +194,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # ── multi-day trading ─────────────────────────────────────────────────────
+    g = p.add_argument_group("Multi-day trading")
+    g.add_argument(
+        "--no-trade-tomorrow", action="store_true",
+        help=(
+            "Disable next-day settlement market evaluation. By default, each trade "
+            "date evaluates both today's market (settlement=today) and tomorrow's "
+            "market (settlement=tomorrow) — matching run_live.py's TARGET_DATE + "
+            "TOMORROW_DATE logic. Use this flag to evaluate only same-day markets."
+        ),
+    )
+
     # ── output ────────────────────────────────────────────────────────────────
     g = p.add_argument_group("Output")
     g.add_argument(
@@ -240,6 +252,7 @@ def main() -> None:
         spread_alpha=args.spread_alpha,
         cities=args.cities,
         min_train_rows=args.min_train_rows,
+        trade_tomorrow=not args.no_trade_tomorrow,
         output_dir=args.output_dir,
         verbose=args.verbose,
     )

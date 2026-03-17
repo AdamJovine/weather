@@ -138,7 +138,7 @@ class BacktestEngine:
             shuffled = list(city_records)
             np.random.shuffle(shuffled)
 
-            for city, row_i, city_df, settlement in shuffled:
+            for city, row_i, city_df, settlement, trade_date_str in shuffled:
                 if portfolio.remaining_today() == 0:
                     break
 
@@ -150,7 +150,7 @@ class BacktestEngine:
                 if model is None:
                     continue
 
-                # ── compute probability distribution ONCE per (city, date) ──
+                # ── compute probability distribution ONCE per (city, settlement) ──
                 try:
                     prob_df = model.predict_integer_probs(city_df.iloc[[row_i]])
                     prob_row = prob_df.iloc[0]
@@ -176,7 +176,7 @@ class BacktestEngine:
                                     continue
                                 exit_trade = _build_exit_trade(
                                     run_id=run_id, city=city, s_idx=s_idx,
-                                    session_ts=session.ts, test_row=test_row,
+                                    session_ts=session.ts,
                                     pos=pos, exit_price=intent.price, fair_p=intent.fair_p,
                                     portfolio=portfolio, fee_rate=cfg.fee_rate,
                                 )
@@ -199,7 +199,7 @@ class BacktestEngine:
                                     size=intent.size,
                                     entry_session=s_idx,
                                     entry_session_ts=session.ts,
-                                    entry_date=str(test_row["date"])[:10],
+                                    entry_date=trade_date_str,
                                 ))
                     else:
                         if not portfolio.can_trade():
@@ -213,7 +213,8 @@ class BacktestEngine:
                                 break
                             trade = _build_trade_from_intent(
                                 run_id=run_id, city=city, session=s_idx,
-                                session_ts=session.ts, test_row=test_row,
+                                session_ts=session.ts, trade_date_str=trade_date_str,
+                                test_row=test_row,
                                 intent=intent, portfolio=portfolio,
                                 fee_rate=cfg.fee_rate,
                             )
@@ -248,9 +249,15 @@ class BacktestEngine:
         self,
         city_frames: dict[str, pd.DataFrame],
         cfg: BacktestConfig,
-    ) -> list[tuple[pd.Timestamp, list[tuple[str, int, pd.DataFrame]]]]:
+    ) -> list[tuple[pd.Timestamp, list[tuple[str, int, pd.DataFrame, "dt_date", str]]]]:
         """
-        Build an ordered list of (date, [(city, row_idx, city_df), ...]).
+        Build an ordered list of (trade_date, [(city, row_idx, city_df, settlement_date, trade_date_str), ...]).
+
+        Each entry represents one (city, settlement_date) pair to evaluate on trade_date.
+        When cfg.trade_tomorrow=True, two entries are produced per city per day — mirroring
+        run_live.py's TARGET_DATE + TOMORROW_DATE logic:
+          - today's market:    settlement_date == trade_date
+          - tomorrow's market: settlement_date == trade_date + 1
 
         Only includes rows where:
           - date is in [start_date, end_date]
@@ -278,13 +285,20 @@ class BacktestEngine:
                 if city_df.iloc[[i]][FEATURES].isnull().any(axis=1).iloc[0]:
                     continue
 
+                trade_date_str = date.date().isoformat()
+
                 # Today's market: snapshot taken today, settles today
+                # Mirrors TARGET_DATE in run_live.py
                 if self.price_store.has_data(city, date.date()):
-                    day_map.setdefault(date, []).append((city, i, city_df, date.date()))
+                    day_map.setdefault(date, []).append(
+                        (city, i, city_df, date.date(), trade_date_str)
+                    )
 
                 # Tomorrow's market: snapshot taken today, settles tomorrow.
-                # Use the D+1 feature row so the model predicts tomorrow's temp.
-                if i + 1 < len(city_df):
+                # Mirrors TOMORROW_DATE in run_live.py.
+                # Uses the D+1 feature row so the model predicts tomorrow's temp,
+                # but records the trade as occurring on today (trade_date_str).
+                if cfg.trade_tomorrow and i + 1 < len(city_df):
                     next_row = city_df.iloc[i + 1]
                     next_date = pd.Timestamp(next_row["date"])
                     tomorrow = date + pd.Timedelta(days=1)
@@ -295,7 +309,9 @@ class BacktestEngine:
                         and not city_df.iloc[[i + 1]][FEATURES].isnull().any(axis=1).iloc[0]
                         and self.price_store.has_data(city, tomorrow.date())
                     ):
-                        day_map.setdefault(date, []).append((city, i + 1, city_df, tomorrow.date()))
+                        day_map.setdefault(date, []).append(
+                            (city, i + 1, city_df, tomorrow.date(), trade_date_str)
+                        )
 
         return sorted(day_map.items())
 
@@ -395,6 +411,7 @@ def _build_trade_from_intent(
     city: str,
     session: int,
     session_ts: int,
+    trade_date_str: str,
     test_row: pd.Series,
     intent: "OrderIntent",
     portfolio: Portfolio,
@@ -432,7 +449,7 @@ def _build_trade_from_intent(
 
     return Trade(
         run_id=run_id,
-        date=str(test_row["date"])[:10],
+        date=trade_date_str,
         city=city,
         session=session,
         session_ts=session_ts,
@@ -456,7 +473,6 @@ def _build_exit_trade(
     city: str,
     s_idx: int,
     session_ts: int,
-    test_row: pd.Series,
     pos: "OpenPosition",
     exit_price: float,
     fair_p: float,

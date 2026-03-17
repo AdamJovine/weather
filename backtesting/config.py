@@ -146,6 +146,12 @@ class BacktestConfig:
     E.g. 50.0 = only trade contracts that cleared at least 50 contracts
     in that hourly snapshot — avoids stale/thin prices."""
 
+    # ── Multi-day trading ────────────────────────────────────────────────────
+    trade_tomorrow: bool = True
+    """When True, each trade date also evaluates the next-day settlement market
+    using tomorrow's feature row — mirroring run_live.py's TOMORROW_DATE logic.
+    Set to False to trade only same-day settling contracts."""
+
     # ── Output ───────────────────────────────────────────────────────────────
     output_dir: str = "logs/backtest"
     verbose: bool = False

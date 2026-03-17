@@ -142,6 +142,31 @@ class ModelState:
         np.save(self.out_dir / "X_obs.npy", self.X_obs[:self.n_evals])
         np.save(self.out_dir / "y_obs.npy", self.y_obs[:self.n_evals])
 
+    def load_state(self) -> None:
+        """Restore GP observations and best params from disk (for --resume)."""
+        x_path    = self.out_dir / "X_obs.npy"
+        y_path    = self.out_dir / "y_obs.npy"
+        best_path = self.out_dir / "best.json"
+        bl_path   = self.out_dir / "blacklisted.json"
+
+        if x_path.exists() and y_path.exists():
+            X = np.load(x_path)
+            y = np.load(y_path)
+            n = len(y)
+            cap = self.X_obs.shape[0]
+            n = min(n, cap)
+            self.X_obs[:n] = X[:n]
+            self.y_obs[:n] = y[:n]
+            self.n_evals   = n
+
+        if best_path.exists():
+            best = json.load(open(best_path))
+            self.best_pnl    = float(best.get("total_pnl", -np.inf))
+            self.best_params = best.get("params", {})
+
+        if bl_path.exists():
+            self.blacklisted = True
+
 
 # ── Disk I/O helpers (called immediately after each eval) ────────────────────
 
@@ -286,6 +311,7 @@ def run_mega_tune(
     n_init:      int,
     rng:         np.random.Generator,
     n_jobs:      int = 4,
+    start_round: int = 0,
 ) -> None:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -294,7 +320,7 @@ def run_mega_tune(
         initializer=_worker_init,
         initargs=(dataset, price_store, eval_cfg),
     ) as pool:
-        for round_idx in range(n_rounds):
+        for round_idx in range(start_round, n_rounds):
             active = [m for m in models if m.is_active]
             if not active:
                 print("\nAll models blacklisted — stopping early.")
@@ -421,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Parallel worker processes. [2]")
     p.add_argument("--list", action="store_true",
                    help="Print models + search spaces then exit.")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from the last completed round (reads progress.json + X/y_obs.npy).")
     return p
 
 
@@ -494,10 +522,34 @@ def main() -> None:
 
     n_init = min(args.n_init, args.n_rounds)
 
+    # ── Step 3b: restore prior state if resuming ──────────────────────────────
+    start_round = 0
+    if args.resume:
+        progress_path = OUT_ROOT / "progress.json"
+        if progress_path.exists():
+            prog = json.load(open(progress_path))
+            start_round = int(prog.get("rounds_done", 0))
+            print(f"Resuming from round {start_round}/{args.n_rounds} "
+                  f"(read from {progress_path})")
+        else:
+            print("--resume specified but no progress.json found — starting fresh.")
+        for state in model_states:
+            state.load_state()
+            if state.n_evals:
+                flag = " [BLACKLISTED]" if state.blacklisted else ""
+                print(f"  {state.name}: loaded {state.n_evals} obs, "
+                      f"best=${state.best_pnl:+.2f}{flag}")
+        print()
+
+    if start_round >= args.n_rounds:
+        print(f"Already completed {start_round}/{args.n_rounds} rounds — nothing to do.")
+        print("Use --n-rounds N with N > {start_round} to run more rounds.")
+        return
+
     print(f"\n{'='*70}")
-    print(f"MEGA TUNE")
+    print(f"MEGA TUNE{'  (RESUMED)' if args.resume else ''}")
     print(f"  Models:        {', '.join(models_to_run)}")
-    print(f"  Rounds:        {args.n_rounds}  (init: {n_init})")
+    print(f"  Rounds:        {start_round} done → {args.n_rounds} total  (init: {n_init})")
     print(f"  Window:        {eval_cfg.start_date} → {eval_cfg.end_date}")
     print(f"  Sessions/day:  all  |  refit_every: {eval_cfg.refit_every}d")
     print(f"  Max bet:       ${eval_cfg.max_bet_dollars}/trade  |  "
@@ -518,6 +570,7 @@ def main() -> None:
         n_init=n_init,
         rng=rng,
         n_jobs=args.n_jobs,
+        start_round=start_round,
     )
 
 

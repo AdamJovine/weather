@@ -184,7 +184,9 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     else:
         TARGET_DATE = (date.today() + timedelta(days=1)).isoformat()
 
-    print(f"=== Weather Kalshi Bot — {model_name} — {TARGET_DATE} ===")
+    TOMORROW_DATE = (pd.to_datetime(TARGET_DATE) + timedelta(days=1)).date().isoformat()
+
+    print(f"=== Weather Kalshi Bot — {model_name} — {TARGET_DATE} + {TOMORROW_DATE} ===")
     print(f"Mode: {'DRY RUN (no orders)' if dry_run else '*** LIVE TRADING ***'}")
     print(f"Bankroll: ${BANKROLL:.2f}\n")
 
@@ -213,6 +215,12 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     # Load Kalshi series separately (trading-specific)
     with get_db() as conn:
         _ph = pd.read_sql("SELECT DISTINCT series FROM kalshi_markets", conn)
+        nws_tmrw = pd.read_sql(
+            "SELECT city, forecast_high, nbm_high, target_date "
+            "FROM nws_forecasts WHERE target_date = ?",
+            conn,
+            params=(TOMORROW_DATE,),
+        )
 
     tradeable_series = set(_ph["series"].tolist()) if not _ph.empty else None
 
@@ -224,6 +232,15 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     else:
         print(f"NWS forecasts loaded for {TARGET_DATE}:")
         print(forecast_df.to_string(index=False))
+
+    # Append tomorrow's NWS forecasts so feature table covers both dates
+    if nws_tmrw.empty:
+        print(f"WARNING: no NWS forecasts in DB for {TOMORROW_DATE}. "
+              "Run: python scripts/update_data.py --only nws")
+    else:
+        print(f"NWS forecasts loaded for {TOMORROW_DATE}:")
+        print(nws_tmrw.to_string(index=False))
+        forecast_df = pd.concat([forecast_df, nws_tmrw], ignore_index=True)
 
     # Restrict trading to cities with Kalshi price history
     if tradeable_series is not None:
@@ -341,6 +358,27 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
             print("  No observations returned — proceeding with model-only probabilities.")
         print()
 
+    # 4c. Build probability rows for tomorrow
+    print(f"\nBuilding predictions for {TOMORROW_DATE}...")
+    pred_rows_tmrw = {}
+    for city, model in models.items():
+        city_df = df[(df["city"] == city) & (df["date"] == pd.to_datetime(TOMORROW_DATE))]
+        if city_df.empty:
+            print(f"  {city}: no feature row for {TOMORROW_DATE}")
+            continue
+        if city_df[FEATURES].isnull().any(axis=1).iloc[0]:
+            print(f"  {city}: NaN in features for {TOMORROW_DATE}, skipping")
+            continue
+
+        mu_arr, *_ = model.predict_with_uncertainty(city_df)
+        pred_mean = float(mu_arr[0])
+        probs_df = model.predict_integer_probs(city_df)
+        prob_row = probs_df.iloc[0]
+        pred_rows_tmrw[city] = prob_row
+
+        fcast_high = city_df.iloc[0].get("forecast_high")
+        print(f"  {city}: pred_mean={pred_mean:.1f}°F  forecast_high={fcast_high}")
+
     # 5. Connect to Kalshi + fetch live markets and positions
     print("\nConnecting to Kalshi...")
     try:
@@ -352,7 +390,11 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
 
     print(f"Fetching weather markets for {TARGET_DATE}...")
     weather_markets = fetch_weather_markets(auth, tradeable_stations, TARGET_DATE)
-    print(f"  {len(weather_markets)} total markets to evaluate.\n")
+    print(f"  {len(weather_markets)} markets for {TARGET_DATE}.")
+
+    print(f"Fetching weather markets for {TOMORROW_DATE}...")
+    weather_markets_tmrw = fetch_weather_markets(auth, tradeable_stations, TOMORROW_DATE)
+    print(f"  {len(weather_markets_tmrw)} markets for {TOMORROW_DATE}.\n")
 
     # Load UCB city allocation state
     city_ucb = CityUCB(cities=tradeable_stations["city"].tolist())
@@ -392,7 +434,7 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     }
 
     # Log market snapshots for every market (pre-pass, regardless of edge)
-    for market in weather_markets:
+    for market in weather_markets + weather_markets_tmrw:
         ticker = market.get("ticker", "")
         log_market_snapshot(
             market_ticker=ticker,
@@ -405,7 +447,10 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
         )
 
     # 7. Evaluate all markets via PortfolioManager (exits first, then entries)
-    intents = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers)
+    # Run separately per date so each uses the correct prediction distribution.
+    intents_today = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers)
+    intents_tmrw  = pm.evaluate(weather_markets_tmrw, pred_rows_tmrw, positions, BANKROLL, city_multipliers)
+    intents = intents_today + intents_tmrw
 
     sell_intents = [i for i in intents if i.action == "sell"]
     buy_intents  = [i for i in intents if i.action == "buy"]

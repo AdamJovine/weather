@@ -1,0 +1,25 @@
+# Database
+data/*.db
+
+# Logs - generated output
+logs/*.csv
+logs/*.png
+logs/*.json
+logs/mega_tune/
+logs/backtest/
+logs/forecast_backtest/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store

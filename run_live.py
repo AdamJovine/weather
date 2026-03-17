@@ -2,22 +2,26 @@
 Main live trading loop.
 
 Phases:
-  1. Load config and historical data
-  2. Refresh GFS/ECMWF/ICON + GEFS spread with latest model runs (live APIs)
-  3. Build features + fit model per city
-  4. Fetch today's NWS forecasts
-  5. Build prediction rows for target date
-  6. Fetch Kalshi weather markets by series ticker
-  7. For each market: parse, price, compute edge, log recommendation
-  8. (Optional) Place orders if --live flag is set
+  1. Load all data from DB (run scripts/update_data.py first to refresh)
+  2. Build features + fit model per city
+  3. Build prediction rows for target date
+  4. Fetch live Kalshi weather markets + current positions
+  5. Evaluate edge via PortfolioManager, log recommendations
+  6. (Optional) Place orders if --live flag is set
 
 Usage:
   python run_live.py                     # dry run — logs recommendations only
   python run_live.py --live              # places orders (use demo URL first!)
   python run_live.py --interval 30       # re-run every 30 minutes (dry run)
   python run_live.py --live --interval 30  # live trading, refreshed every 30 min
+
+IMPORTANT: Always run scripts/update_data.py before this script to ensure
+           all data sources (GFS, GEFS, NWS, NOAA) are fresh in the DB.
 """
 
+import json
+import math
+import subprocess
 import sys
 import time
 import argparse
@@ -27,28 +31,69 @@ from pathlib import Path
 
 import pandas as pd
 
-import pickle
+sys.path.insert(0, str(Path("scripts")))
+import tune_hyperparams as _th
 
 from src.config import KALSHI_BASE_URL
 from src.features import build_feature_table
-from src.model import InteractionBayesModel, FEATURES
+import src.model as _model_module
+from src.model import FEATURES
 from src.kalshi_client import KalshiWeatherClient
-from src.strategy import evaluate_market
 from src.logger import log_trade, log_forecast, log_market_snapshot
-from src.noaa_forecast import get_forecasts_for_stations
 from src.ucb import CityUCB
-from src.live_data import fetch_live_openmeteo, fetch_live_gefs_spread, upsert_live
-from src.db import DB_PATH, get_db, read_df as db_read, check_freshness_db
+from src.db import DB_PATH, get_db, check_freshness_db
+from src.data_loader_shared import load_raw_sources
+from src.portfolio_manager import PortfolioManager, OrderIntent
+from src.fetchers import fetch_current_obs
+from src.config import TEMP_GRID_MIN, TEMP_GRID_MAX
 
 
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
 
-BANKROLL = 100.0
+BANKROLL = 5.0
+
+OUT_ROOT = Path("logs/mega_tune")
+
 STATIONS_FILE = Path("data/stations.csv")
-HISTORY_FILE = Path("data/historical_tmax.csv")
 KALSHI_RATE_SLEEP = 0.5   # seconds between Kalshi API calls
+
+
+# ------------------------------------------------------------------
+# Intraday running-max constraint
+# ------------------------------------------------------------------
+
+def _apply_running_max_constraint(prob_row: "pd.Series", running_max_f: float) -> "pd.Series":
+    """
+    Zero out all probability mass for integer temperatures strictly below
+    the observed intraday running maximum, then renormalize.
+
+    The daily high is monotonically non-decreasing: once the METAR reports
+    88°F, the final high cannot be less than 88°F.  Applying this constraint
+    sharpens the model sharply on same-day trades.
+
+    Parameters
+    ----------
+    prob_row      : Series with keys "temp_{k}" for k in TEMP_GRID_MIN..MAX
+    running_max_f : Observed intraday high in °F (float from METAR)
+
+    Returns a copy of prob_row with updated probabilities.
+    """
+    cutoff = math.floor(running_max_f)   # lowest possible integer tmax
+    row = prob_row.copy()
+    for k in range(TEMP_GRID_MIN, cutoff):
+        key = f"temp_{k}"
+        if key in row.index:
+            row[key] = 0.0
+    # Renormalize remaining mass
+    total = sum(float(row.get(f"temp_{k}", 0.0)) for k in range(cutoff, TEMP_GRID_MAX + 1))
+    if total > 0:
+        for k in range(cutoff, TEMP_GRID_MAX + 1):
+            key = f"temp_{k}"
+            if key in row.index:
+                row[key] = float(row[key]) / total
+    return row
 
 
 # ------------------------------------------------------------------
@@ -62,6 +107,28 @@ def kalshi_get_raw(auth, path: str, params: dict = None) -> dict:
     r = requests.get(url, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def fetch_live_market_price(auth, ticker: str) -> dict | None:
+    """
+    Fetch the current yes_ask_dollars and no_ask_dollars for a single market.
+    Returns None if the fetch fails or prices are unavailable.
+    This is called immediately before order placement to ensure we trade at live prices.
+    """
+    try:
+        data = kalshi_get_raw(auth, f"/markets/{ticker}")
+        market = data.get("market", data)  # some endpoints wrap in "market" key
+        yes_ask = market.get("yes_ask_dollars")
+        no_ask  = market.get("no_ask_dollars")
+        if yes_ask is None or no_ask is None:
+            return None
+        return {
+            "yes_ask_dollars": float(yes_ask),
+            "no_ask_dollars":  float(no_ask),
+        }
+    except Exception as e:
+        print(f"  Warning: could not refresh price for {ticker}: {e}")
+        return None
 
 
 def fetch_weather_markets(auth, stations: pd.DataFrame, target_date: str) -> list[dict]:
@@ -98,55 +165,65 @@ def fetch_weather_markets(auth, stations: pd.DataFrame, target_date: str) -> lis
 # Main
 # ------------------------------------------------------------------
 
-def main(dry_run: bool = True):
-    TARGET_DATE = (date.today() + timedelta(days=1)).isoformat()
+def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
+    from datetime import datetime as _dt
 
-    print(f"=== Weather Kalshi Bot — {TARGET_DATE} ===")
+    # Reload best params on every cycle so mega_tune improvements are picked up live
+    best_path = OUT_ROOT / model_name / "best.json"
+    if not best_path.exists():
+        print(f"ERROR: no best.json for model '{model_name}' at {best_path}")
+        sys.exit(1)
+    _BEST = json.load(open(best_path))["params"]
+    _model_module.SPREAD_ALPHA = float(_BEST["spread_alpha"])
+
+    _now = _dt.now()
+    # Before 4 pm local time, today's markets are still open — trade same-day.
+    # After 4 pm, target tomorrow.
+    if _now.hour < 16:
+        TARGET_DATE = date.today().isoformat()
+    else:
+        TARGET_DATE = (date.today() + timedelta(days=1)).isoformat()
+
+    print(f"=== Weather Kalshi Bot — {model_name} — {TARGET_DATE} ===")
     print(f"Mode: {'DRY RUN (no orders)' if dry_run else '*** LIVE TRADING ***'}")
     print(f"Bankroll: ${BANKROLL:.2f}\n")
 
-    # 1. Load data
+    # 1. Refresh all data sources (GFS, GEFS, NWS, NOAA) into the DB
+    print("Refreshing data...")
+    result = subprocess.run([sys.executable, "scripts/update_data.py"], check=False)
+    if result.returncode != 0:
+        print("WARNING: update_data.py returned non-zero — proceeding with existing DB data.")
+    print()
+
+    # 2. Load all data from DB
     stations = pd.read_csv(STATIONS_FILE)
 
-    if DB_PATH.exists():
-        # ── Read from SQLite (primary path) ──────────────────────────────────
-        print(f"Reading from {DB_PATH}...")
-        with get_db() as conn:
-            hist       = db_read(conn, "weather_daily")
-            _gfs       = db_read(conn, "forecasts_daily")
-            _gefs      = db_read(conn, "gefs_spread")
-            _indices   = db_read(conn, "climate_monthly")
-            _mjo       = db_read(conn, "mjo_daily")
-            _ph        = pd.read_sql(
-                "SELECT DISTINCT series FROM kalshi_markets", conn
-            )
-        gfs_df     = _gfs     if not _gfs.empty     else None
-        gefs_df    = _gefs    if not _gefs.empty    else None
-        indices_df = _indices if not _indices.empty else None
-        mjo_df     = _mjo     if not _mjo.empty     else None
-        tradeable_series = set(_ph["series"].tolist()) if not _ph.empty else None
+    if not DB_PATH.exists():
+        print("ERROR: database not found. Run scripts/update_data.py first.")
+        sys.exit(1)
+
+    print(f"Reading from {DB_PATH}...")
+    sources = load_raw_sources(DB_PATH, nws_target_date=TARGET_DATE, verbose=True)
+    hist         = sources["hist"]
+    gfs_df       = sources["gfs"]
+    gefs_df      = sources["gefs"]
+    indices_df   = sources["indices"]
+    mjo_df       = sources["mjo"]
+    forecast_df  = sources["nws"]
+    # Load Kalshi series separately (trading-specific)
+    with get_db() as conn:
+        _ph = pd.read_sql("SELECT DISTINCT series FROM kalshi_markets", conn)
+
+    tradeable_series = set(_ph["series"].tolist()) if not _ph.empty else None
+
+    # NWS forecasts for target date — mandatory for live prediction
+    if forecast_df.empty:
+        print(f"WARNING: no NWS forecasts in DB for {TARGET_DATE}. "
+              "Run: python scripts/update_data.py --only nws")
+        forecast_df = pd.DataFrame(columns=["city", "forecast_high", "nbm_high", "target_date"])
     else:
-        # ── CSV fallback (before first migration) ─────────────────────────
-        if not HISTORY_FILE.exists():
-            print("ERROR: no data found. Run scripts/download_history.py "
-                  "then scripts/migrate_to_db.py.")
-            sys.exit(1)
-        print("DB not found — reading from CSVs (run scripts/migrate_to_db.py to migrate).")
-        hist = pd.read_csv(HISTORY_FILE)
-        gfs_path   = Path("data/forecasts/openmeteo_forecast_history.csv")
-        gefs_path  = Path("data/forecasts/gefs_spread.csv")
-        indices_path = Path("data/climate_indices.csv")
-        mjo_path   = Path("data/mjo_indices.csv")
-        gfs_df     = pd.read_csv(gfs_path)     if gfs_path.exists()     else None
-        gefs_df    = pd.read_csv(gefs_path)    if gefs_path.exists()    else None
-        indices_df = pd.read_csv(indices_path) if indices_path.exists() else None
-        mjo_df     = pd.read_csv(mjo_path)     if mjo_path.exists()     else None
-        price_history_path = Path("data/kalshi_price_history.csv")
-        if price_history_path.exists():
-            ph = pd.read_csv(price_history_path, usecols=["series"])
-            tradeable_series = set(ph["series"].unique())
-        else:
-            tradeable_series = None
+        print(f"NWS forecasts loaded for {TARGET_DATE}:")
+        print(forecast_df.to_string(index=False))
 
     # Restrict trading to cities with Kalshi price history
     if tradeable_series is not None:
@@ -160,71 +237,27 @@ def main(dry_run: bool = True):
         tradeable_stations = stations.copy()
         print("Warning: no Kalshi price history — trading all cities (no history filter)")
 
-    print(f"Loaded {len(hist)} historical rows for {hist['city'].nunique()} cities.")
-    if gfs_df is not None:
-        print(f"Loaded {len(gfs_df)} GFS forecast rows.")
-    if indices_df is not None:
-        print(f"Loaded {len(indices_df)} climate index rows.")
-    if gefs_df is not None:
-        print(f"Loaded {len(gefs_df)} GEFS spread rows.")
-    if mjo_df is not None:
-        print(f"Loaded {len(mjo_df)} MJO index rows.")
-
-    # 1b. Freshness check — warn if any data source is stale
+    # Freshness check — abort if any data source is stale
     print("\n--- Data freshness ---")
-    if DB_PATH.exists():
-        with get_db() as conn:
-            for r in check_freshness_db(conn):
-                print(r.summary())
+    with get_db() as conn:
+        for r in check_freshness_db(conn):
+            print(r.summary())
     print()
 
-    # 2. Refresh with latest model runs from OpenMeteo live APIs
-    # GFS/ECMWF/ICON updates 4x/day; GEFS ensemble spread updates 4x/day.
-    # Today's live run is inserted as today's date in gfs_df — after the
-    # 1-day shift in build_feature_table() it becomes tomorrow's features.
-    print("\nFetching live model data...")
-    live_gfs = fetch_live_openmeteo(stations)
-    if not live_gfs.empty:
-        gfs_df = upsert_live(gfs_df, live_gfs)
-        print(f"  OpenMeteo: refreshed {len(live_gfs)} rows for {live_gfs['city'].nunique()} cities")
-    else:
-        print("  OpenMeteo: no live data retrieved, using CSV cache")
-
-    live_gefs = fetch_live_gefs_spread(stations, TARGET_DATE)
-    if not live_gefs.empty:
-        gefs_df = upsert_live(gefs_df, live_gefs)
-        print(f"  GEFS spread: refreshed {len(live_gefs)} rows for {live_gefs['city'].nunique()} cities")
-    else:
-        print("  GEFS spread: no live data retrieved, using CSV cache")
-
-    # 3. Fetch NWS forecasts
-    print(f"\nFetching NWS forecasts for {TARGET_DATE}...")
-    forecast_df = get_forecasts_for_stations(stations, target_date=TARGET_DATE)
-    print(forecast_df.to_string(index=False))
-
-    # Save to rolling forecast archive
-    archive = Path("data/forecasts/forecast_archive.csv")
-    if archive.exists():
-        existing = pd.read_csv(archive)
-        pd.concat([existing, forecast_df]).drop_duplicates(
-            subset=["city", "target_date"]
-        ).to_csv(archive, index=False)
-    else:
-        forecast_df.to_csv(archive, index=False)
-
-    # 4. Build features — GFS fills historical forecast_high; NWS/NBM covers today/tomorrow
+    # 2. Build features — GFS fills historical forecast_high; NWS/NBM covers target date
     df = build_feature_table(hist, forecast_df, gfs_df=gfs_df, indices_df=indices_df,
                              gefs_df=gefs_df, mjo_df=mjo_df)
     df["forecast_high"] = df["forecast_high"].fillna(df["climo_mean_doy"])
     df["forecast_minus_climo"] = df["forecast_high"] - df["climo_mean_doy"]
 
-    # 5. Fit model per city
+    # 3. Fit model per city
     print("\nFitting models...")
     models = {}
     for city in stations["city"]:
         city_df = df[df["city"] == city].copy()
         train_df = city_df[city_df["date"] < pd.to_datetime(TARGET_DATE)]
-        model = InteractionBayesModel()
+        model = _th.make_model(model_name, _BEST)
+        model._lookback = int(_BEST["lookback"])
         try:
             model.fit(train_df)
             models[city] = model
@@ -237,7 +270,7 @@ def main(dry_run: bool = True):
     calibrator = None
     print("Using raw model probabilities (calibrator disabled).")
 
-    # 6. Build probability rows for target date (using freshly fetched features)
+    # 4. Build probability rows for target date
     print(f"\nBuilding predictions for {TARGET_DATE}...")
     pred_rows = {}
     for city, model in models.items():
@@ -285,7 +318,30 @@ def main(dry_run: bool = True):
         )
         print(f"  {city}: pred_mean={pred_mean:.1f}°F  forecast_high={fcast_high}")
 
-    # 7. Connect to Kalshi + fetch markets
+    # 4b. Same-day only: fetch live METAR obs and apply running-max constraint.
+    # Once a station reports e.g. 88°F, the daily high cannot be below 88°F.
+    # Zeroing probability mass below the running max sharpens the distribution
+    # and produces near-certain fair_p values when the outcome is already decided.
+    is_same_day = (TARGET_DATE == date.today().isoformat())
+    if is_same_day:
+        print("\nFetching live METAR observations (same-day trading)...")
+        obs = fetch_current_obs(stations)
+        if obs:
+            for city, info in sorted(obs.items()):
+                running_max = info["running_max_f"]
+                current     = info["current_temp_f"]
+                print(f"  {city:20s}  current={current:.1f}°F  "
+                      f"running_max={running_max:.1f}°F  "
+                      f"obs={info['obs_count']}  @{info['latest_obs_utc']}")
+                if city in pred_rows:
+                    pred_rows[city] = _apply_running_max_constraint(
+                        pred_rows[city], running_max
+                    )
+        else:
+            print("  No observations returned — proceeding with model-only probabilities.")
+        print()
+
+    # 5. Connect to Kalshi + fetch live markets and positions
     print("\nConnecting to Kalshi...")
     try:
         kalshi = KalshiWeatherClient.from_env()
@@ -323,16 +379,21 @@ def main(dry_run: bool = True):
         print(f"Warning: could not fetch positions ({e}) — assuming no open positions.")
         positions = {}
 
-    # 9. Evaluate each market
-    all_recommendations = []
+    # 6. Build PortfolioManager and evaluate all markets (entries + exits)
+    pm = PortfolioManager(
+        kelly_fraction=float(_BEST["kelly_fraction"]),
+        max_bet_fraction=float(_BEST["max_bet_frac"]),
+        min_edge=float(_BEST["min_edge"]),
+        min_confidence=float(_BEST["min_confidence"]),
+    )
+    city_multipliers = {
+        city: city_ucb.kelly_multiplier(city)
+        for city in tradeable_stations["city"].tolist()
+    }
 
+    # Log market snapshots for every market (pre-pass, regardless of edge)
     for market in weather_markets:
-        city = market.get("_city")
         ticker = market.get("ticker", "")
-
-        if city not in pred_rows:
-            continue
-
         log_market_snapshot(
             market_ticker=ticker,
             title=market.get("title", ""),
@@ -343,88 +404,143 @@ def main(dry_run: bool = True):
             close_time=str(market.get("close_time") or ""),
         )
 
-        trades = evaluate_market(
-            market=market,
-            prob_row=pred_rows[city],
-            bankroll=BANKROLL,
-            city_map={},
-            city_multiplier=city_ucb.kelly_multiplier(city),
+    # 7. Evaluate all markets via PortfolioManager (exits first, then entries)
+    intents = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers)
+
+    sell_intents = [i for i in intents if i.action == "sell"]
+    buy_intents  = [i for i in intents if i.action == "buy"]
+
+    # Log and optionally place sell (exit) orders
+    print("--- Checking open positions for exits ---")
+    if sell_intents:
+        for intent in sell_intents:
+            print(
+                f"  EXIT [{intent.city}] {intent.ticker}\n"
+                f"    side={intent.side}  contracts={intent.contracts:.1f}"
+                f"  fair_p={intent.fair_p:.3f}  exit_price={intent.price:.2f}"
+            )
+            log_trade(
+                market_ticker=intent.ticker,
+                city=intent.city,
+                market_type=intent.contract_def.get("market_type", ""),
+                contract_desc=intent.title,
+                fair_p=intent.fair_p,
+                yes_ask=0,
+                no_ask=0,
+                edge_yes=0,
+                edge_no=0,
+                action="sell" if not dry_run else "recommend_exit",
+                side=intent.side,
+                size_dollars=intent.size,
+                contract_count=intent.contracts,
+                status="dry_run" if dry_run else "pending",
+            )
+
+        if not dry_run:
+            print(f"\nPlacing {len(sell_intents)} exit order(s)...")
+            for intent in sell_intents:
+                try:
+                    # Re-fetch live price immediately before exit to trade at current market
+                    live = fetch_live_market_price(auth, intent.ticker)
+                    if live is not None:
+                        live_yes = live["yes_ask_dollars"]
+                        live_no  = live["no_ask_dollars"]
+                        live_bid = max(0.0, 1.0 - live_no) if intent.side == "yes" else max(0.0, 1.0 - live_yes)
+                        stale_price = intent.price
+                        if abs(live_bid - stale_price) >= 0.01:
+                            print(f"  {intent.ticker}: exit price updated {stale_price:.4f} → {live_bid:.4f}")
+                        # Re-validate: if the position has recovered and entry edge is
+                        # still valid at the live price, hold rather than exit.
+                        if intent.side == "yes":
+                            live_entry_edge = intent.fair_p - live_yes
+                        else:
+                            live_entry_edge = (1.0 - intent.fair_p) - live_no
+                        if live_entry_edge >= pm.min_edge:
+                            print(
+                                f"  {intent.ticker}: position recovered at live price "
+                                f"(live_edge={live_entry_edge:.4f} >= {pm.min_edge:.4f}) — holding"
+                            )
+                            continue
+                        exit_price = live_bid
+                    else:
+                        exit_price = intent.price
+                    resp = kalshi.place_order(
+                        ticker=intent.ticker,
+                        side=intent.side,
+                        count=max(1, round(intent.contracts)),
+                        price=int(round(exit_price * 100)),
+                        action="sell",
+                    )
+                    print(f"  Exit order placed: {resp}")
+                except Exception as e:
+                    print(f"  Exit order failed for {intent.ticker}: {e}")
+        else:
+            print(f"Dry run: would exit {len(sell_intents)} position(s).")
+    else:
+        print("  No positions require exit.")
+    print()
+
+    # Log and optionally place buy (entry) orders
+    print("--- Entry recommendations ---")
+    for intent in buy_intents:
+        print(
+            f"  [{intent.city}] {intent.ticker}\n"
+            f"    fair_p={intent.fair_p:.3f}  ask={intent.price:.2f}"
+            f"  edge={intent.edge:.3f}  side={intent.side}  contracts={intent.contracts:.2f}"
+        )
+        log_trade(
+            market_ticker=intent.ticker,
+            city=intent.city,
+            market_type=intent.contract_def.get("market_type", ""),
+            contract_desc=intent.title,
+            fair_p=intent.fair_p,
+            yes_ask=intent.price if intent.side == "yes" else 0,
+            no_ask=intent.price if intent.side == "no" else 0,
+            edge_yes=intent.edge if intent.side == "yes" else 0,
+            edge_no=intent.edge if intent.side == "no" else 0,
+            action="recommend" if dry_run else "place",
+            side=intent.side,
+            size_dollars=intent.size,
+            contract_count=intent.contracts,
+            status="dry_run" if dry_run else "pending",
         )
 
-        for trade in trades:
-            side = trade["side"]
-            target = trade["contract_count"]
-            net_pos = positions.get(ticker, 0)
-            held = max(0, net_pos) if side == "yes" else max(0, -net_pos)
-            delta = max(0.0, target - held)
-            trade["delta_contracts"] = round(delta, 4)
-            trade["held_contracts"]  = round(held, 4)
-
-            print(
-                f"  [{city}] {ticker}\n"
-                f"    title:  {market.get('title')}\n"
-                f"    fair_p={trade['fair_p']:.3f}  ask={trade['price_dollars']:.2f}"
-                f"  edge={trade['edge']:.3f}  side={side}"
-                f"  target={target:.2f}  held={held:.2f}  delta={delta:.2f}"
-            )
-
-            log_trade(
-                market_ticker=ticker,
-                city=city,
-                market_type=trade.get("market_type", ""),
-                contract_desc=market.get("title", ""),
-                fair_p=trade["fair_p"],
-                yes_ask=market.get("yes_ask_dollars") or 0,
-                no_ask=market.get("no_ask_dollars") or 0,
-                edge_yes=trade["edge"] if side == "yes" else 0,
-                edge_no=trade["edge"] if side == "no" else 0,
-                action="recommend" if dry_run else "place",
-                side=side,
-                size_dollars=trade["dollar_size"],
-                contract_count=delta,
-                status="dry_run" if dry_run else ("skip" if delta <= 0 else "pending"),
-            )
-
-            all_recommendations.append(trade)
-
-        if not trades:
-            print(f"  [{city}] {ticker}: no edge  (fair={compute_fair_for_log(market, pred_rows[city])})")
-
-    # 10. Place orders (live mode only) — only the delta needed to reach Kelly target
-    if not dry_run and all_recommendations:
-        actionable = [t for t in all_recommendations if t["delta_contracts"] > 0]
-        skipped    = len(all_recommendations) - len(actionable)
-        if skipped:
-            print(f"\n{skipped} market(s) already at/above Kelly target — skipping.")
-        print(f"Placing {len(actionable)} orders...")
-        for trade in actionable:
+    # 8. Place buy orders (live mode only)
+    if not dry_run and buy_intents:
+        print(f"Placing {len(buy_intents)} orders...")
+        for intent in buy_intents:
             try:
+                # Re-fetch the live ask price immediately before entry to catch any market moves
+                live = fetch_live_market_price(auth, intent.ticker)
+                if live is not None:
+                    live_ask = live["yes_ask_dollars"] if intent.side == "yes" else live["no_ask_dollars"]
+                    stale_ask = intent.price
+                    if abs(live_ask - stale_ask) >= 0.01:
+                        print(f"  {intent.ticker}: ask moved {stale_ask:.4f} → {live_ask:.4f}")
+                    # Re-validate edge at current live price
+                    live_edge = intent.fair_p - live_ask if intent.side == "yes" else (1.0 - intent.fair_p) - live_ask
+                    if live_edge < pm.min_edge:
+                        print(f"  {intent.ticker}: edge gone at live price ({live_edge:.4f} < {pm.min_edge:.4f}) — skipping")
+                        continue
+                    order_price = live_ask
+                else:
+                    order_price = intent.price
                 resp = kalshi.place_order(
-                    ticker=trade["ticker"],
-                    side=trade["side"],
-                    count=max(1, round(trade["delta_contracts"])),
-                    price=int(round(trade["price_dollars"] * 100)),
+                    ticker=intent.ticker,
+                    side=intent.side,
+                    count=max(1, round(intent.contracts)),
+                    price=int(round(order_price * 100)),
                 )
                 print(f"  Order placed: {resp}")
             except Exception as e:
-                print(f"  Order failed for {trade['ticker']}: {e}")
+                raw_body = getattr(e, "body", None)
+                print(f"  Order failed for {intent.ticker}: {e}")
+                if raw_body and raw_body != str(e):
+                    print(f"    Raw body: {raw_body}")
     else:
-        actionable = [t for t in all_recommendations if t["delta_contracts"] > 0]
-        print(f"\nDry run complete: {len(actionable)} new / "
-              f"{len(all_recommendations) - len(actionable)} already positioned.")
+        print(f"\nDry run complete: {len(buy_intents)} entry recommendation(s).")
 
     print("Done.")
-
-
-def compute_fair_for_log(market: dict, prob_row) -> str:
-    """Utility to show fair value in no-edge log lines."""
-    from src.strategy import parse_contract
-    from src.pricing import compute_fair_prob
-    try:
-        contract = parse_contract(market.get("title", ""), "")
-        return f"{compute_fair_prob(prob_row, contract):.3f}"
-    except Exception:
-        return "n/a"
 
 
 if __name__ == "__main__":
@@ -434,13 +550,17 @@ if __name__ == "__main__":
         "--interval", type=int, default=0, metavar="MINUTES",
         help="Re-run every N minutes using the latest model data (0 = run once)",
     )
+    parser.add_argument(
+        "--model", type=str, default="BaggingRidge", metavar="MODEL",
+        help="Model name matching a subdirectory in logs/mega_tune/ (default: BaggingRidge)",
+    )
     args = parser.parse_args()
 
     if args.interval > 0:
         print(f"Loop mode: refreshing every {args.interval} minutes. Ctrl+C to stop.\n")
         while True:
-            main(dry_run=not args.live)
+            main(dry_run=not args.live, model_name=args.model)
             print(f"\nNext run in {args.interval}m — waiting for next model update...\n")
             time.sleep(args.interval * 60)
     else:
-        main(dry_run=not args.live)
+        main(dry_run=not args.live, model_name=args.model)

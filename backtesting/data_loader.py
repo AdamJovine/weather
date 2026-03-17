@@ -1,6 +1,6 @@
 """
-DataLoader: loads every CSV source, validates integrity, builds the feature
-table, and returns a BacktestDataset ready for the engine.
+DataLoader: loads every data source from the DB, validates integrity, builds
+the feature table, and returns a BacktestDataset ready for the engine.
 
 The loader is intentionally loud about what it finds (or doesn't find) so you
 never have silent fallbacks producing subtly wrong results.
@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
 from backtesting.validators import DataValidator, ValidationReport
+from src.db import DB_PATH
+from src.data_loader_shared import load_raw_sources
 
 
 @dataclass
@@ -46,16 +47,15 @@ class BacktestDataset:
 
 class DataLoader:
     """
-    Loads all data sources from the project data/ directory, runs validation,
+    Loads all data sources from the SQLite database, runs validation,
     builds the feature table, and returns a BacktestDataset.
 
-    All data paths are relative to data_dir (default: "data").
-    Missing optional sources degrade gracefully with printed warnings —
+    Missing optional tables degrade gracefully with printed warnings —
     no silent suppression.
     """
 
-    def __init__(self, data_dir: str = "data") -> None:
-        self.data_dir = Path(data_dir)
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self.db_path = Path(db_path)
 
     def load(
         self,
@@ -64,7 +64,7 @@ class DataLoader:
     ) -> BacktestDataset:
         """
         Full pipeline:
-          1. Load raw CSVs
+          1. Load raw tables from DB
           2. Validate each source
           3. Build merged feature table
           4. Post-merge feature validation
@@ -76,11 +76,22 @@ class DataLoader:
         from src.model import FEATURES
 
         print("Loading data sources...")
-        hist_df = self._load_historical()
-        gfs_df = self._load_gfs()
-        indices_df = self._load_climate_indices()
-        gefs_df = self._load_gefs()
-        mjo_df = self._load_mjo()
+        sources = load_raw_sources(self.db_path, nws_target_date=None, verbose=True)
+
+        hist_df    = sources["hist"]
+        gfs_df     = sources["gfs"]
+        indices_df = sources["indices"]
+        gefs_df    = sources["gefs"]
+        mjo_df     = sources["mjo"]
+
+        if hist_df.empty:
+            raise ValueError("weather_daily table is empty — run scripts/update_data.py.")
+
+        # Use NWS history when available; fall back to empty placeholder
+        if not sources["nws"].empty:
+            forecast_df = sources["nws"]
+        else:
+            forecast_df = pd.DataFrame(columns=["city", "forecast_high", "target_date"])
 
         # ── validation ────────────────────────────────────────────────────────
         validator = DataValidator()
@@ -97,8 +108,6 @@ class DataLoader:
 
         # ── feature table ─────────────────────────────────────────────────────
         print("  Building feature table...")
-        # NWS live forecasts are absent in backtest mode; pass empty placeholder
-        forecast_df = pd.DataFrame(columns=["city", "forecast_high", "target_date"])
         df = build_feature_table(
             hist_df,
             forecast_df,
@@ -149,52 +158,4 @@ class DataLoader:
             validation_report=report,
         )
 
-    # ── private loaders ───────────────────────────────────────────────────────
-
-    def _load_historical(self) -> pd.DataFrame:
-        path = self.data_dir / "historical_tmax.csv"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Historical TMAX data not found at {path}. "
-                "Run scripts/download_history.py first."
-            )
-        df = pd.read_csv(path)
-        print(f"  historical_tmax         : {len(df):>7,} rows")
-        return df
-
-    def _load_gfs(self) -> Optional[pd.DataFrame]:
-        path = self.data_dir / "forecasts" / "openmeteo_forecast_history.csv"
-        if not path.exists():
-            print("  openmeteo_forecast_history: NOT FOUND — using climatology as forecast")
-            return None
-        df = pd.read_csv(path)
-        print(f"  openmeteo_forecast_history: {len(df):>7,} rows")
-        return df
-
-    def _load_climate_indices(self) -> Optional[pd.DataFrame]:
-        path = self.data_dir / "climate_indices.csv"
-        if not path.exists():
-            print("  climate_indices         : NOT FOUND — AO/ONI/NAO features will be absent")
-            return None
-        df = pd.read_csv(path)
-        print(f"  climate_indices         : {len(df):>7,} rows")
-        return df
-
-    def _load_gefs(self) -> Optional[pd.DataFrame]:
-        path = self.data_dir / "forecasts" / "gefs_spread.csv"
-        if not path.exists():
-            print("  gefs_spread             : NOT FOUND — falling back to ensemble_spread")
-            return None
-        df = pd.read_csv(path)
-        print(f"  gefs_spread             : {len(df):>7,} rows")
-        return df
-
-    def _load_mjo(self) -> Optional[pd.DataFrame]:
-        path = self.data_dir / "mjo_indices.csv"
-        if not path.exists():
-            print("  mjo_indices             : NOT FOUND — MJO features will be zero")
-            return None
-        df = pd.read_csv(path)
-        print(f"  mjo_indices             : {len(df):>7,} rows")
-        return df
 

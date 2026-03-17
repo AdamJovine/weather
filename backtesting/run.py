@@ -245,11 +245,11 @@ def main() -> None:
     )
 
     # ── Load price history (once, reused across all runs) ─────────────────────
-    price_store = KalshiPriceStore(data_dir="data").load(verbose=args.verbose)
+    price_store = KalshiPriceStore().load(verbose=args.verbose)
     print(price_store.coverage_summary())
 
     # ── Load and validate feature data ────────────────────────────────────────
-    loader = DataLoader(data_dir="data")
+    loader = DataLoader()
     dataset = loader.load(cfg, skip_validation=args.no_validate)
 
     # ── Run backtest ──────────────────────────────────────────────────────────

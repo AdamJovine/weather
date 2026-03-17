@@ -1,31 +1,23 @@
 """
 src/data_contracts.py
 
-Schema contracts, validation, atomic CSV writes, and staleness monitoring
-for all weather data sources.
+Schema contracts, validation, and atomic CSV writes for weather data.
 
 Typical usage
 ─────────────
-Validate and write atomically (download scripts):
-
-    from src.data_contracts import SCHEMAS, atomic_write_csv
-
-    result = atomic_write_csv(df, Path("data/historical_tmax.csv"),
-                              SCHEMAS["historical_tmax"])
-    for w in result.warnings:
-        print(f"  WARN: {w}")
-
-Check freshness before trading (run_live.py):
-
-    from src.data_contracts import check_all_freshness
-
-    for r in check_all_freshness(warn_only=True):
-        print(r.summary())
-
 Validate an in-memory DataFrame (tests / ad-hoc):
 
     result = SCHEMAS["gefs_spread"].validate(df)
     result.raise_if_errors()
+
+Validate and write atomically (used by tests):
+
+    from src.data_contracts import SCHEMAS, atomic_write_csv
+
+    result = atomic_write_csv(df, tmp_path / "out.csv", SCHEMAS["historical_tmax"])
+
+Note: production freshness checks use check_freshness_db() from src.db,
+not check_all_freshness() here.
 """
 
 from __future__ import annotations
@@ -264,6 +256,12 @@ SCHEMAS: dict[str, DataSchema] = {
                                               min_val=-25.0, max_val=25.0),
             "precip_forecast":     ColumnSpec(max_nan_fraction=0.03,
                                               min_val=0.0,   max_val=500.0),
+        "temp_850hpa":         ColumnSpec(max_nan_fraction=0.05,
+                                              min_val=-100.0, max_val=120.0),
+        "shortwave_radiation": ColumnSpec(max_nan_fraction=0.05,
+                                              min_val=0.0,    max_val=40.0),
+        "dew_point_max":       ColumnSpec(max_nan_fraction=0.05,
+                                              min_val=-60.0,  max_val=100.0),
         },
         primary_key=["date", "city"],
         max_age_days=2,        # should have yesterday's GFS run at minimum
@@ -322,16 +320,6 @@ SCHEMAS: dict[str, DataSchema] = {
     ),
 }
 
-# ─── File path registry ───────────────────────────────────────────────────────
-
-DATA_FILES: dict[str, Path] = {
-    "historical_tmax":     Path("data/historical_tmax.csv"),
-    "openmeteo_forecasts": Path("data/forecasts/openmeteo_forecast_history.csv"),
-    "gefs_spread":         Path("data/forecasts/gefs_spread.csv"),
-    "climate_indices":     Path("data/climate_indices.csv"),
-    "mjo_indices":         Path("data/mjo_indices.csv"),
-}
-
 
 # ─── Atomic write ─────────────────────────────────────────────────────────────
 
@@ -374,12 +362,12 @@ def atomic_write_csv(
 # ─── Freshness check (all sources) ───────────────────────────────────────────
 
 def check_all_freshness(
-    files: dict[str, Path] | None = None,
+    files: dict[str, Path],
     *,
     warn_only: bool = False,
 ) -> list[ValidationResult]:
     """
-    Check the freshness of every registered data file.
+    Check the freshness of the provided data files.
 
     For each source:
       - Missing file        → error
@@ -388,14 +376,7 @@ def check_all_freshness(
 
     If warn_only=False (default), raises DataValidationError listing every
     stale source.  Returns all results regardless so callers can log them.
-
-    Example (run_live.py):
-        results = check_all_freshness(warn_only=True)
-        for r in results:
-            print(r.summary())
     """
-    if files is None:
-        files = DATA_FILES
 
     results: list[ValidationResult] = []
 

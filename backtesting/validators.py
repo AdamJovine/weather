@@ -167,7 +167,7 @@ class DataValidator:
         n_dupes = int(df.duplicated(subset=["city", "date"]).sum())
         if n_dupes:
             report.add("error", "historical_duplicates",
-                       f"{n_dupes} duplicate (city, date) rows in historical_tmax.csv",
+                       f"{n_dupes} duplicate (city, date) rows in weather_daily table",
                        n=n_dupes)
 
         # Temperature range

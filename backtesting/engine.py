@@ -62,7 +62,8 @@ import pandas as pd
 from backtesting.config import BacktestConfig
 from backtesting.data_loader import BacktestDataset
 from backtesting.market_data import KalshiPriceStore, Session
-from backtesting.portfolio import Portfolio, Trade
+from backtesting.portfolio import Portfolio, Trade, OpenPosition
+from src.portfolio_manager import PortfolioManager, OrderIntent
 
 # A model factory is any callable that takes no arguments and returns a
 # fitted-model-ready instance. Used by the hyperparameter tuner to inject
@@ -128,6 +129,8 @@ class BacktestEngine:
 
         day_groups = self._build_day_groups(city_frames, cfg)
 
+        pm = PortfolioManager.from_config(cfg)
+
         for date, city_records in day_groups:
             portfolio.begin_day(date.isoformat()[:10])
 
@@ -135,11 +138,10 @@ class BacktestEngine:
             shuffled = list(city_records)
             np.random.shuffle(shuffled)
 
-            for city, row_i, city_df in shuffled:
+            for city, row_i, city_df, settlement in shuffled:
                 if portfolio.remaining_today() == 0:
                     break
 
-                settlement = date.date()  # pd.Timestamp → datetime.date
                 sessions = self._pick_sessions(city, settlement, cfg)
                 if not sessions:
                     continue
@@ -162,26 +164,76 @@ class BacktestEngine:
                 for s_idx, session in enumerate(sessions):
                     portfolio.begin_session(s_idx)
 
-                    if not portfolio.can_trade():
-                        break
+                    if cfg.allow_exits:
+                        markets = _session_to_markets(session, city, cfg.half_spread)
+                        bt_positions = _backtest_positions(portfolio, city)
+                        intents = pm.evaluate(markets, {city: prob_row}, bt_positions, portfolio.bankroll)
 
-                    candidates = _select_candidates(prob_row, session, cfg)
+                        for intent in intents:
+                            if intent.action == "sell":
+                                pos = portfolio.close_position(intent.ticker)
+                                if pos is None:
+                                    continue
+                                exit_trade = _build_exit_trade(
+                                    run_id=run_id, city=city, s_idx=s_idx,
+                                    session_ts=session.ts, test_row=test_row,
+                                    pos=pos, exit_price=intent.price, fair_p=intent.fair_p,
+                                    portfolio=portfolio, fee_rate=cfg.fee_rate,
+                                )
+                                portfolio.record_trade(exit_trade, count_toward_limits=False)
 
-                    for candidate in candidates:
+                            elif intent.action == "buy":
+                                if not portfolio.can_trade():
+                                    break
+                                portfolio.open_position(OpenPosition(
+                                    city=city,
+                                    ticker=intent.ticker,
+                                    title=intent.title,
+                                    contract_type=intent.contract_def["market_type"],
+                                    threshold=_threshold_from_def(intent.contract_def),
+                                    contract_def=intent.contract_def,
+                                    side=intent.side,
+                                    entry_mkt_p=intent.price,
+                                    entry_model_p=intent.fair_p,
+                                    entry_edge=intent.edge,
+                                    size=intent.size,
+                                    entry_session=s_idx,
+                                    entry_session_ts=session.ts,
+                                    entry_date=str(test_row["date"])[:10],
+                                ))
+                    else:
                         if not portfolio.can_trade():
                             break
-                        trade = _build_trade(
+                        markets = _session_to_markets(session, city, cfg.half_spread)
+                        intents = pm.evaluate(markets, {city: prob_row}, {}, portfolio.bankroll)
+                        for intent in intents:
+                            if intent.action != "buy":
+                                continue
+                            if not portfolio.can_trade():
+                                break
+                            trade = _build_trade_from_intent(
+                                run_id=run_id, city=city, session=s_idx,
+                                session_ts=session.ts, test_row=test_row,
+                                intent=intent, portfolio=portfolio,
+                                fee_rate=cfg.fee_rate,
+                            )
+                            if trade is not None:
+                                portfolio.record_trade(trade)
+
+                # Settle any positions still open for this city (not exited)
+                if cfg.allow_exits:
+                    for ticker, pos in list(portfolio.open_positions_for_city(city).items()):
+                        portfolio.close_position(ticker)
+                        settle = _build_settlement_trade(
                             run_id=run_id,
                             city=city,
-                            session=s_idx,
-                            session_ts=session.ts,
                             test_row=test_row,
-                            candidate=candidate,
+                            pos=pos,
                             portfolio=portfolio,
                             fee_rate=cfg.fee_rate,
                         )
-                        if trade is not None:
-                            portfolio.record_trade(trade)
+                        if settle is not None:
+                            portfolio.record_trade(settle, count_toward_limits=False)
 
         return RunResult(
             run_id=run_id,
@@ -225,11 +277,25 @@ class BacktestEngine:
                     continue
                 if city_df.iloc[[i]][FEATURES].isnull().any(axis=1).iloc[0]:
                     continue
-                # Only include dates where real price data exists
-                if not self.price_store.has_data(city, date.date()):
-                    continue
 
-                day_map.setdefault(date, []).append((city, i, city_df))
+                # Today's market: snapshot taken today, settles today
+                if self.price_store.has_data(city, date.date()):
+                    day_map.setdefault(date, []).append((city, i, city_df, date.date()))
+
+                # Tomorrow's market: snapshot taken today, settles tomorrow.
+                # Use the D+1 feature row so the model predicts tomorrow's temp.
+                if i + 1 < len(city_df):
+                    next_row = city_df.iloc[i + 1]
+                    next_date = pd.Timestamp(next_row["date"])
+                    tomorrow = date + pd.Timedelta(days=1)
+                    if (
+                        next_date == tomorrow
+                        and tomorrow <= end
+                        and not pd.isna(next_row.get("y_tmax"))
+                        and not city_df.iloc[[i + 1]][FEATURES].isnull().any(axis=1).iloc[0]
+                        and self.price_store.has_data(city, tomorrow.date())
+                    ):
+                        day_map.setdefault(date, []).append((city, i + 1, city_df, tomorrow.date()))
 
         return sorted(day_map.items())
 
@@ -267,7 +333,7 @@ class BacktestEngine:
         """Return a fitted model, refitting only when refit_every days have elapsed."""
         if city in model_state:
             cached_model, last_refit_date = model_state[city]
-            if (current_date - last_refit_date).days < cfg.refit_every:
+            if (current_date - last_refit_date).days < cfg.effective_refit_every:
                 return cached_model
 
         lb = cfg.lookback if cfg.lookback > 0 else row_i
@@ -288,97 +354,80 @@ class BacktestEngine:
         return model
 
 
-# ── contract selection (module-level for testability) ─────────────────────────
+def _session_to_markets(session: Session, city: str, half_spread: float = 0.0) -> list[dict]:
+    """Convert a backtest Session to PortfolioManager-compatible market dicts.
 
-def _select_candidates(
-    prob_row: pd.Series,
-    session: Session,
-    cfg: BacktestConfig,
-) -> list[dict]:
+    half_spread adds a simulated bid-ask spread so yes_ask + no_ask > 1.0,
+    matching real Kalshi execution costs.  With half_spread=0.01 the total
+    round-trip spread is ~2 cents, consistent with liquid temperature markets.
     """
-    Evaluate every contract in this session against the model's probability
-    distribution. Return candidates with edge >= min_edge, sorted by edge.
-
-    For each ParsedContract:
-      fair_p = compute_fair_prob(prob_row, contract_def)   ← full discrete distribution
-      yes_edge = fair_p - close_dollars
-      no_edge  = close_dollars - fair_p   (= 1 - fair_p) - (1 - close_dollars)
-
-    We take the better side. No edge → skipped.
-    """
-    from src.pricing import compute_fair_prob
-
-    candidates = []
-    for pc in session.contracts:
-        try:
-            fair_p = float(compute_fair_prob(prob_row, pc.contract_def))
-        except Exception:
-            continue
-
-        mkt_p = pc.close_dollars
-        yes_edge = fair_p - mkt_p
-        no_edge = mkt_p - fair_p   # equivalent to (1-fair_p) - (1-mkt_p)
-
-        if yes_edge >= no_edge and yes_edge >= cfg.min_edge:
-            side, edge = "yes", yes_edge
-        elif no_edge > yes_edge and no_edge >= cfg.min_edge:
-            side, edge = "no", no_edge
-        else:
-            continue
-
-        candidates.append({
-            "ticker":        pc.ticker,
-            "title":         pc.title,
-            "contract_def":  pc.contract_def,
-            "contract_type": pc.contract_type,
-            "threshold":     pc.display_threshold,
-            "side":          side,
-            "mkt_p":         mkt_p,
-            "model_p":       fair_p,
-            "edge":          edge,
-        })
-
-    candidates.sort(key=lambda x: -x["edge"])
-    return candidates
+    return [
+        {
+            "ticker": pc.ticker,
+            "title": pc.title,
+            "_city": city,
+            "yes_ask_dollars": min(0.99, round(pc.close_dollars + half_spread, 6)),
+            "no_ask_dollars": min(0.99, round(1.0 - pc.close_dollars + half_spread, 6)),
+            "volume": pc.volume,
+        }
+        for pc in session.contracts
+    ]
 
 
-def _build_trade(
+def _backtest_positions(portfolio: Portfolio, city: str) -> dict[str, float]:
+    """Net YES contracts for all open positions in this city.
+    Positive = long yes, negative = long no (matches PortfolioManager convention)."""
+    return {
+        ticker: (pos.size if pos.side == "yes" else -pos.size)
+        for ticker, pos in portfolio.open_positions_for_city(city).items()
+    }
+
+
+def _threshold_from_def(contract_def: dict) -> int:
+    """Extract the display threshold integer from a parsed contract definition."""
+    if "threshold" in contract_def:
+        return int(contract_def["threshold"])
+    return int(contract_def.get("low", 0))
+
+
+def _build_trade_from_intent(
     run_id: int,
     city: str,
     session: int,
     session_ts: int,
     test_row: pd.Series,
-    candidate: dict,
+    intent: "OrderIntent",
     portfolio: Portfolio,
     fee_rate: float = 0.02,
 ) -> Optional[Trade]:
-    """Convert a candidate contract into a Trade with Kelly sizing and realised PnL."""
-    size = portfolio.kelly_size(candidate["edge"])
-    if size <= 0:
-        return None
+    """
+    Settle a PortfolioManager buy intent against the observed y_tmax.
 
-    contract_def = candidate["contract_def"]
-    contract_type = candidate["contract_type"]
-    side = candidate["side"]
-    mkt_p = candidate["mkt_p"]
+    Used by the allow_exits=False path: PM sizes and selects the trade;
+    we immediately compute final PnL from the day's outcome.
+    """
     y_tmax = float(test_row["y_tmax"])
+    cd = intent.contract_def
 
-    # Settle the contract (YES-side outcome)
-    if contract_type == "geq":
-        outcome_yes = int(y_tmax >= contract_def["threshold"])
-    elif contract_type == "leq":
-        outcome_yes = int(y_tmax <= contract_def["threshold"])
-    elif contract_type == "range":
-        outcome_yes = int(contract_def["low"] <= y_tmax <= contract_def["high"])
+    if cd["market_type"] == "geq":
+        outcome_yes = int(y_tmax >= cd["threshold"])
+    elif cd["market_type"] == "leq":
+        outcome_yes = int(y_tmax <= cd["threshold"])
+    elif cd["market_type"] == "range":
+        outcome_yes = int(cd["low"] <= y_tmax <= cd["high"])
     else:
         return None
 
+    side = intent.side
+    mkt_p = intent.price
     outcome = outcome_yes if side == "yes" else (1 - outcome_yes)
 
+    # intent.size is the dollar cost; contracts = size / price (ask paid)
+    contracts = intent.size / mkt_p
     if side == "yes":
-        gross_pnl = size * (outcome_yes - mkt_p)
+        gross_pnl = contracts * (outcome_yes - mkt_p)
     else:
-        gross_pnl = size * ((1 - outcome_yes) - (1 - mkt_p))
+        gross_pnl = contracts * ((1 - outcome_yes) - mkt_p)
     pnl = gross_pnl - fee_rate * max(gross_pnl, 0.0)
 
     return Trade(
@@ -387,18 +436,127 @@ def _build_trade(
         city=city,
         session=session,
         session_ts=session_ts,
-        ticker=candidate["ticker"],
-        title=candidate["title"],
-        contract_type=contract_type,
-        threshold=candidate["threshold"],
+        ticker=intent.ticker,
+        title=intent.title,
+        contract_type=cd["market_type"],
+        threshold=_threshold_from_def(cd),
         side=side,
         mkt_p=mkt_p,
-        model_p=candidate["model_p"],
-        edge=candidate["edge"],
-        size=size,
+        model_p=intent.fair_p,
+        edge=intent.edge,
+        size=intent.size,
         pnl=pnl,
         outcome=outcome,
         bankroll_after=portfolio.bankroll + pnl,
+    )
+
+
+def _build_exit_trade(
+    run_id: int,
+    city: str,
+    s_idx: int,
+    session_ts: int,
+    test_row: pd.Series,
+    pos: "OpenPosition",
+    exit_price: float,
+    fair_p: float,
+    portfolio: Portfolio,
+    fee_rate: float,
+) -> Trade:
+    """
+    Build a Trade representing an early exit from a position.
+
+    PnL is realised mark-to-market: (exit_price - entry_price) per contract.
+    exit_price is the bid received when closing (yes_bid for YES, no_bid for NO).
+    entry_mkt_p is the ask paid when opening (yes_ask for YES, no_ask for NO).
+    Same formula for both sides: profit = (sell_price - buy_price) × contracts.
+    """
+    contracts = pos.size / pos.entry_mkt_p
+    gross_pnl = contracts * (exit_price - pos.entry_mkt_p)
+
+    pnl = gross_pnl - fee_rate * max(gross_pnl, 0.0)
+
+    return Trade(
+        run_id=run_id,
+        date=pos.entry_date,
+        city=city,
+        session=s_idx,
+        session_ts=session_ts,
+        ticker=pos.ticker,
+        title=pos.title,
+        contract_type=pos.contract_type,
+        threshold=pos.threshold,
+        side=pos.side,
+        mkt_p=exit_price,
+        model_p=fair_p,
+        edge=0.0,
+        size=pos.size,
+        pnl=pnl,
+        outcome=1 if pnl >= 0 else 0,
+        bankroll_after=portfolio.bankroll + pnl,
+        trade_type="exit",
+        entry_mkt_p=pos.entry_mkt_p,
+    )
+
+
+def _build_settlement_trade(
+    run_id: int,
+    city: str,
+    test_row: pd.Series,
+    pos: "OpenPosition",
+    portfolio: Portfolio,
+    fee_rate: float,
+) -> Optional[Trade]:
+    """
+    Settle an open position using the observed y_tmax (end-of-day outcome).
+
+    This mirrors the PnL logic in _build_trade_from_intent but operates on a
+    stored OpenPosition rather than an OrderIntent.
+    """
+    y_tmax = float(test_row["y_tmax"])
+    cd = pos.contract_def
+
+    if pos.contract_type == "geq":
+        outcome_yes = int(y_tmax >= cd["threshold"])
+    elif pos.contract_type == "leq":
+        outcome_yes = int(y_tmax <= cd["threshold"])
+    elif pos.contract_type == "range":
+        outcome_yes = int(cd["low"] <= y_tmax <= cd["high"])
+    else:
+        return None
+
+    outcome = outcome_yes if pos.side == "yes" else (1 - outcome_yes)
+    mkt_p = pos.entry_mkt_p
+
+    # pos.size is the dollar cost; contracts = size / price (ask paid at entry)
+    contracts = pos.size / mkt_p
+    if pos.side == "yes":
+        gross_pnl = contracts * (outcome_yes - mkt_p)
+    else:
+        gross_pnl = contracts * ((1 - outcome_yes) - mkt_p)
+
+    pnl = gross_pnl - fee_rate * max(gross_pnl, 0.0)
+
+    return Trade(
+        run_id=run_id,
+        date=pos.entry_date,
+        city=city,
+        session=pos.entry_session,
+        session_ts=pos.entry_session_ts,
+        ticker=pos.ticker,
+        title=pos.title,
+        contract_type=pos.contract_type,
+        threshold=pos.threshold,
+        side=pos.side,
+        mkt_p=mkt_p,
+        model_p=pos.entry_model_p,
+        edge=pos.entry_edge,
+        size=pos.size,
+        pnl=pnl,
+        outcome=outcome,
+        bankroll_after=portfolio.bankroll + pnl,
+        trade_type="settle",
+        entry_mkt_p=mkt_p,
     )
 
 
@@ -413,13 +571,22 @@ def _print_run_summary(result: "RunResult") -> None:  # noqa: F821
     if df.empty:
         print("  No trades — check that price history covers the backtest date range.")
         return
-    total_pnl = df["pnl"].sum()
+
+    total_pnl     = df["pnl"].sum()
     total_wagered = df["size"].sum()
-    roi = total_pnl / total_wagered if total_wagered > 0 else 0.0
-    win_rate = (df["pnl"] > 0).mean()
-    final_br = df["bankroll_after"].iloc[-1]
+    roi           = total_pnl / total_wagered if total_wagered > 0 else 0.0
+    win_rate      = (df["pnl"] > 0).mean()
+    final_br      = df["bankroll_after"].iloc[-1]
+    start_br      = result.config.initial_bankroll
+
+    daily = df.groupby("date")["pnl"].sum()
+    d_mean = daily.mean()
+    d_std  = daily.std()
+    d_min  = daily.min()
+    d_max  = daily.max()
+
     print(
-        f"  trades={len(df):,}  ROI={roi:+.2%}  "
-        f"win={win_rate:.1%}  PnL=${total_pnl:,.2f}  "
-        f"bankroll=${final_br:,.2f}"
+        f"  trades={len(df):,}  wagered=${total_wagered:,.2f}  ROI={roi:+.2%}  win={win_rate:.1%}\n"
+        f"  PnL=${total_pnl:+,.2f}  bankroll=${start_br:,.2f} → ${final_br:,.2f}\n"
+        f"  daily PnL — mean=${d_mean:+.2f}  std=${d_std:.2f}  min=${d_min:+.2f}  max=${d_max:+.2f}"
     )

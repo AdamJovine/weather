@@ -23,7 +23,23 @@ MODEL_REGISTRY: dict[str, str] = {
     "GBResidual":       "GBResidualModel",
 }
 
-DEFAULT_CITIES: list[str] = ["New York", "Chicago", "Phoenix", "Miami"]
+# Minimum refit cadence per model (days).
+# Linear/Bayesian models are fast enough for daily refits; tree/ensemble models
+# don't meaningfully improve with sub-weekly refitting on this data size and
+# have expensive fit costs. The effective cadence = max(user refit_every, this floor).
+MODEL_REFIT_EVERY: dict[str, int] = {
+    "GBResidual":    14,
+    "RandomForest":  14,
+    "ExtraTrees":    14,
+    "NGBoost":       14,
+    "KernelRidge":   14,
+    "QuantileGB":    14,
+}
+
+DEFAULT_CITIES: list[str] = [
+    "New York", "Chicago", "Phoenix", "Miami",
+    "Denver", "Los Angeles", "Houston", "Austin",
+]
 DEFAULT_THRESHOLD_OFFSETS: list[int] = [-12, -9, -6, -3, 0, 3, 6, 9, 12]
 
 
@@ -78,6 +94,10 @@ class BacktestConfig:
     min_edge: float = 0.05
     """Minimum expected edge before placing a trade."""
 
+    min_confidence: float = 0.0
+    """Only enter when fair_p >= 0.5 + min_confidence (YES) or <= 0.5 - min_confidence (NO).
+    0.0 = no filter. 0.15 = model must be ≥65% confident. Controls win rate directly."""
+
     n_thompson_draws: int = 100
     """Posterior samples drawn per prediction for Thompson Sampling."""
 
@@ -94,6 +114,37 @@ class BacktestConfig:
 
     threshold_offsets: Optional[List[int]] = None
     """Temperature thresholds as offsets from climo mean. None = default grid."""
+
+    # ── Exit logic ───────────────────────────────────────────────────────────
+    allow_exits: bool = True
+    """When True, positions are exited early if the market price has moved to
+    (or beyond) the model's fair value — i.e. no edge remains.
+    When False, all positions are held to settlement (original behaviour)."""
+
+    exit_edge_threshold: float = 0.0
+    """Exit a held YES position when current_price >= fair_p - exit_edge_threshold.
+    0.0 = exit exactly at fair value; positive values exit slightly before fair
+    value is reached (e.g. 0.02 exits when 2 cents of edge remain)."""
+
+    # ── Probability band filter ───────────────────────────────────────────────
+    min_fair_p: float = 0.05
+    """Skip entries where fair_p < min_fair_p (near-certain NO outcome)."""
+
+    max_fair_p: float = 0.95
+    """Skip entries where fair_p > max_fair_p (near-certain YES outcome)."""
+
+    # ── Execution realism ─────────────────────────────────────────────────────
+    half_spread: float = 0.01
+    """Half the bid-ask spread in dollars, added to both yes_ask and no_ask.
+    With half_spread=0.01: yes_ask + no_ask = 1.02 (2-cent total spread),
+    matching the typical 1-2 cent spread seen on Kalshi temperature markets.
+    Set to 0.0 to disable spread simulation."""
+
+    min_contract_volume: float = 0.0
+    """Minimum contracts traded in the candle to be eligible for entry.
+    0.0 = no filter (beyond the global MIN_VOLUME=10 at load time).
+    E.g. 50.0 = only trade contracts that cleared at least 50 contracts
+    in that hourly snapshot — avoids stale/thin prices."""
 
     # ── Output ───────────────────────────────────────────────────────────────
     output_dir: str = "logs/backtest"
@@ -122,3 +173,14 @@ class BacktestConfig:
     @property
     def model_class_name(self) -> str:
         return MODEL_REGISTRY[self.model_name]
+
+    @property
+    def effective_refit_every(self) -> int:
+        """Refit cadence with per-model floor applied.
+
+        Slow tree/ensemble models are floored at MODEL_REFIT_EVERY[model] so
+        they don't refit every day by default. The user's --refit-every only
+        takes effect if it's *higher* than the floor.
+        """
+        floor = MODEL_REFIT_EVERY.get(self.model_name, 1)
+        return max(self.refit_every, floor)

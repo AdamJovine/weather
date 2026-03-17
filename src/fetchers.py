@@ -202,10 +202,15 @@ def _get_openmeteo_client():
         import openmeteo_requests
         import requests_cache
         from retry_requests import retry
+
+        def _log_retry(r, *args, **kwargs):
+            if r.status_code >= 400:
+                print(f"\n    [openmeteo] {r.status_code} — retrying...", flush=True)
+
         cache = requests_cache.CachedSession(".cache/openmeteo", expire_after=-1)
-        _openmeteo_client = openmeteo_requests.Client(
-            session=retry(cache, retries=5, backoff_factor=0.3)
-        )
+        session = retry(cache, retries=5, backoff_factor=0.5)
+        session.hooks["response"].append(_log_retry)
+        _openmeteo_client = openmeteo_requests.Client(session=session)
     return _openmeteo_client
 
 
@@ -216,41 +221,72 @@ def fetch_city_forecast(
     Fetch GFS + ECMWF day-ahead max-temperature forecasts for one city.
     Returns columns: date, city, forecast_high_gfs, forecast_high_ecmwf,
                      ensemble_spread, ecmwf_minus_gfs, precip_forecast
+
+    Falls back to GFS-only if the multi-model request fails (e.g. icon/ecmwf
+    unavailable for the requested date range), filling ensemble columns with NaN.
     """
     client = _get_openmeteo_client()
-    MODELS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs"]
-    params = {
+    base_params = {
         "latitude":         lat,
         "longitude":        lon,
         "start_date":       start,
         "end_date":         end,
-        "daily":            ["temperature_2m_max", "precipitation_sum"],
+        "daily":            ["temperature_2m_max", "precipitation_sum",
+                             "shortwave_radiation_sum"],
         "temperature_unit": "fahrenheit",
         "timezone":         timezone,
-        "models":           MODELS,
     }
-    responses = client.weather_api(OPENMETEO_FORECAST_URL, params=params)
 
-    daily0 = responses[0].Daily()
-    dates  = pd.date_range(
-        start     = pd.to_datetime(daily0.Time(),    unit="s", utc=True),
-        end       = pd.to_datetime(daily0.TimeEnd(), unit="s", utc=True),
-        freq      = pd.Timedelta(seconds=daily0.Interval()),
-        inclusive = "left",
-    ).tz_localize(None).normalize()
+    MODELS = ["icon_seamless", "ecmwf_ifs04", "ecmwf_ifs"]
+    multi_model = False
+    try:
+        responses = client.weather_api(OPENMETEO_FORECAST_URL,
+                                       params={**base_params, "models": MODELS})
+        multi_model = True
+    except Exception as e:
+        print(f"\n    flatbuffers/multi-model failed — falling back to GFS JSON", flush=True)
 
-    model_tmax, model_precip = [], []
-    for r in responses:
-        d = r.Daily()
-        model_tmax.append(d.Variables(0).ValuesAsNumpy())
-        model_precip.append(d.Variables(1).ValuesAsNumpy())
+    if multi_model:
+        daily0 = responses[0].Daily()
+        dates  = pd.date_range(
+            start     = pd.to_datetime(daily0.Time(),    unit="s", utc=True),
+            end       = pd.to_datetime(daily0.TimeEnd(), unit="s", utc=True),
+            freq      = pd.Timedelta(seconds=daily0.Interval()),
+            inclusive = "left",
+        ).tz_localize(None).normalize()
 
-    stacked         = np.stack(model_tmax)
-    tmax_gfs        = stacked[0]
-    tmax_ecmwf      = stacked[2]
-    ensemble_spread = np.nanstd(stacked, axis=0)
-    ecmwf_minus_gfs = tmax_ecmwf - tmax_gfs
-    precip_forecast = model_precip[0]
+        model_tmax, model_precip, model_srad = [], [], []
+        for r in responses:
+            d = r.Daily()
+            model_tmax.append(d.Variables(0).ValuesAsNumpy())
+            model_precip.append(d.Variables(1).ValuesAsNumpy())
+            model_srad.append(d.Variables(2).ValuesAsNumpy())
+
+        stacked         = np.stack(model_tmax)
+        tmax_gfs        = stacked[0]   # icon_seamless (stored in gfs column for DB compat)
+        tmax_ecmwf      = stacked[1]   # ecmwf_ifs04
+        ensemble_spread = np.nanstd(stacked, axis=0)
+        ecmwf_minus_gfs = tmax_ecmwf - tmax_gfs
+        precip_forecast = model_precip[0]
+        srad_forecast   = model_srad[0]
+    else:
+        # Fallback: plain JSON request for GFS only — bypasses flatbuffers entirely
+        import requests as _req
+        r = _req.get(OPENMETEO_FORECAST_URL, params={
+            **base_params,
+            "models":  "icon_seamless",
+            "format":  "json",
+        }, timeout=30)
+        r.raise_for_status()
+        daily = r.json()["daily"]
+        dates           = pd.to_datetime(daily["time"])
+        tmax_gfs        = np.array(daily["temperature_2m_max"],       dtype=float)
+        precip_forecast = np.array(daily["precipitation_sum"],        dtype=float)
+        srad_forecast   = np.array(daily.get("shortwave_radiation_sum",
+                                             [np.nan] * len(tmax_gfs)), dtype=float)
+        tmax_ecmwf      = np.full_like(tmax_gfs, np.nan)
+        ensemble_spread = np.full_like(tmax_gfs, np.nan)
+        ecmwf_minus_gfs = np.full_like(tmax_gfs, np.nan)
 
     df = pd.DataFrame({
         "date":                dates.date,
@@ -260,8 +296,69 @@ def fetch_city_forecast(
         "ensemble_spread":     np.round(ensemble_spread, 2),
         "ecmwf_minus_gfs":     np.round(ecmwf_minus_gfs, 2),
         "precip_forecast":     np.round(precip_forecast, 2),
+        "shortwave_radiation": np.round(srad_forecast, 2),
     })
-    return df.dropna(subset=["forecast_high_gfs"])
+    df = df.dropna(subset=["forecast_high_gfs"])
+
+    # Fetch hourly 850hPa temperature and dew point, aggregate to daily
+    extras = _fetch_city_hourly_extras(lat, lon, timezone, start, end)
+    if extras is not None:
+        extras["date"] = pd.to_datetime(extras["date"]).dt.date
+        df = df.merge(extras, on="date", how="left")
+
+    return df
+
+
+def _fetch_city_hourly_extras(
+    lat: float, lon: float, timezone: str, start: str, end: str
+) -> "pd.DataFrame | None":
+    """
+    Fetch hourly GFS 850hPa temperature and 2m dew point for one city,
+    aggregate to daily max, and return as a DataFrame with columns:
+        date, temp_850hpa, dew_point_max
+    Returns None on any failure.
+    """
+    import requests as _req
+    try:
+        r = _req.get(
+            OPENMETEO_FORECAST_URL,
+            params={
+                "latitude":         lat,
+                "longitude":        lon,
+                "start_date":       start,
+                "end_date":         end,
+                "hourly":           ["temperature_850hpa", "dew_point_2m"],
+                "temperature_unit": "fahrenheit",
+                "timezone":         timezone,
+                "models":           "gfs_seamless",
+                "format":           "json",
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        hourly = r.json().get("hourly", {})
+        if not hourly or "time" not in hourly:
+            return None
+    except Exception:
+        return None
+
+    df_h = pd.DataFrame({
+        "datetime":        pd.to_datetime(hourly["time"]),
+        "temperature_850": np.array(hourly.get("temperature_850hpa", []), dtype=float),
+        "dew_point":       np.array(hourly.get("dew_point_2m", []),       dtype=float),
+    })
+    df_h["date"] = df_h["datetime"].dt.date
+    daily = (
+        df_h.groupby("date")
+        .agg(
+            temp_850hpa=("temperature_850", "max"),
+            dew_point_max=("dew_point",     "max"),
+        )
+        .reset_index()
+    )
+    daily["temp_850hpa"]   = np.round(daily["temp_850hpa"].astype(float),   1)
+    daily["dew_point_max"] = np.round(daily["dew_point_max"].astype(float), 1)
+    return daily
 
 
 # ─── GEFS ensemble spread ─────────────────────────────────────────────────────
@@ -307,6 +404,157 @@ def fetch_gefs_spread(
                        "gefs_spread": np.round(spread, 2)})
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df.dropna(subset=["gefs_spread"])
+
+
+# ─── OpenMeteo ERA5 archive (recent actuals backfill) ────────────────────────
+
+OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def fetch_obs_actuals(
+    city: str, lat: float, lon: float, timezone: str, start: str, end: str
+) -> pd.DataFrame:
+    """
+    Fetch daily TMAX from the OpenMeteo ERA5 reanalysis archive.
+
+    ERA5 is a high-quality reanalysis product that closely tracks ASOS station
+    observations and is updated daily with a ~5-day lag.  This function is used
+    to fill recent gaps in weather_daily when NOAA GHCN-Daily data is stale.
+
+    Returns columns: date, city, station, tmax (°F).
+    Only rows with non-null tmax are returned.
+    """
+    import requests as _req
+    resp = _req.get(
+        OPENMETEO_ARCHIVE_URL,
+        params={
+            "latitude":         lat,
+            "longitude":        lon,
+            "start_date":       start,
+            "end_date":         end,
+            "daily":            "temperature_2m_max",
+            "temperature_unit": "fahrenheit",
+            "timezone":         timezone,
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise ValueError(
+            f"OpenMeteo archive error {resp.status_code}: "
+            f"{resp.json().get('reason', resp.text)}"
+        )
+
+    daily     = resp.json().get("daily", {})
+    times     = daily.get("time", [])
+    tmax_vals = daily.get("temperature_2m_max", [])
+
+    if not times or not tmax_vals:
+        return pd.DataFrame(columns=["date", "city", "station", "tmax"])
+
+    df = pd.DataFrame({
+        "date":    pd.to_datetime(times).date,
+        "city":    city,
+        "station": "openmeteo_era5",
+        "tmax":    np.round(np.array(tmax_vals, dtype=float), 1),
+    })
+    return df.dropna(subset=["tmax"])
+
+
+# ─── Real-time METAR observations ────────────────────────────────────────────
+
+AVIATIONWX_METAR_URL = "https://aviationweather.gov/api/data/metar"
+
+
+def fetch_current_obs(stations: "pd.DataFrame") -> dict:
+    """
+    Fetch the most recent METAR observations for all stations and return
+    intraday running-maximum temperatures in °F, keyed by city name.
+
+    Uses the Aviation Weather Center API (free, no key required, ~5-60 min
+    update cadence — the same ASOS network Kalshi uses for settlement).
+
+    Returns
+    -------
+    dict[str, dict]:
+        city → {
+            "current_temp_f": float,   # most recent observation
+            "running_max_f":  float,   # highest temp recorded today so far
+            "obs_count":      int,     # number of today's observations used
+            "latest_obs_utc": str,     # ISO timestamp of freshest observation
+        }
+    Only cities with at least one valid observation are included.
+    """
+    if "icao_id" not in stations.columns:
+        return {}
+
+    icao_ids = stations["icao_id"].dropna().tolist()
+    if not icao_ids:
+        return {}
+
+    try:
+        resp = requests.get(
+            AVIATIONWX_METAR_URL,
+            params={
+                "ids":    ",".join(icao_ids),
+                "format": "json",
+                "hours":  "24",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        obs_list = resp.json()
+    except Exception as e:
+        print(f"  [obs] METAR fetch failed: {e}")
+        return {}
+
+    # Build icao → city lookup
+    icao_to_city = dict(zip(stations["icao_id"], stations["city"]))
+
+    # Group observations by station; filter to today (UTC date)
+    from datetime import date as _date, timezone as _tz
+    today_utc = _date.today()
+    grouped: dict[str, list] = {}
+    for obs in obs_list:
+        icao = (obs.get("icaoId") or obs.get("stationId") or "").upper()
+        city = icao_to_city.get(icao)
+        if not city:
+            continue
+        temp_c = obs.get("temp")
+        if temp_c is None:
+            continue
+        try:
+            temp_f = float(temp_c) * 9 / 5 + 32
+        except (TypeError, ValueError):
+            continue
+
+        # obs_time can be epoch int or ISO string
+        raw_time = obs.get("obsTime") or obs.get("receiptTime") or ""
+        try:
+            if isinstance(raw_time, (int, float)):
+                obs_dt = datetime.fromtimestamp(raw_time, tz=timezone.utc)
+            else:
+                obs_dt = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if obs_dt.date() != today_utc:
+            continue
+
+        grouped.setdefault(city, []).append((obs_dt, temp_f))
+
+    result = {}
+    for city, readings in grouped.items():
+        readings.sort(key=lambda x: x[0])   # oldest → newest
+        temps = [t for _, t in readings]
+        latest_dt, latest_temp = readings[-1]
+        result[city] = {
+            "current_temp_f": round(latest_temp, 1),
+            "running_max_f":  round(max(temps), 1),
+            "obs_count":      len(readings),
+            "latest_obs_utc": latest_dt.strftime("%H:%MZ"),
+        }
+
+    return result
 
 
 # ─── Kalshi helpers ───────────────────────────────────────────────────────────

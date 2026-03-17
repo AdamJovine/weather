@@ -186,6 +186,11 @@ class BacktestResults:
         print(f"  Min edge       : {cfg.min_edge}  |  "
               f"lookback: {cfg.lookback} rows  |  "
               f"refit every: {cfg.refit_every}d")
+        exits_label = (
+            f"enabled (threshold={cfg.exit_edge_threshold})"
+            if cfg.allow_exits else "disabled (hold to settlement)"
+        )
+        print(f"  Early exits    : {exits_label}")
         print(f"  Bankroll start : ${cfg.initial_bankroll:,.2f}")
         print(f"  Cities         : {', '.join(cfg.cities)}")
         print()

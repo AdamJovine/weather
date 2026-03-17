@@ -1,9 +1,9 @@
 """
 KalshiPriceStore: load, validate, and index historical Kalshi price data.
 
-The store is built once from data/kalshi_price_history.csv (produced by
-scripts/download_kalshi_history.py) and provides O(1) lookup of the
-pre-settlement hourly sessions available for any (city, settlement_date).
+The store is built once from the DB tables kalshi_candles + kalshi_markets
+and provides O(1) lookup of the pre-settlement hourly sessions available
+for any (city, settlement_date).
 
 Why load once?
   Parsing and indexing ~200k rows takes ~2–3 seconds. The engine runs
@@ -33,6 +33,8 @@ from typing import Optional
 
 import pandas as pd
 
+from src.db import DB_PATH, get_db
+
 
 @dataclass(frozen=True)
 class ParsedContract:
@@ -48,6 +50,7 @@ class ParsedContract:
     title: str
     contract_def: dict          # immutable after creation (use dict but treat as read-only)
     close_dollars: float        # real last-traded price in (0.01, 0.99)
+    volume: float = 0.0         # contracts traded in this candle period
 
     @property
     def contract_type(self) -> str:
@@ -67,8 +70,8 @@ class Session:
     """
     One hourly price snapshot: all contracts available at timestamp ts.
 
-    ts is the candle's end_period_ts (Unix seconds UTC) — exactly as stored
-    in kalshi_price_history.csv.
+    ts is the candle's end_period_ts (Unix seconds UTC) — as stored
+    in the kalshi_candles DB table.
     """
     ts: int
     contracts: list[ParsedContract]
@@ -87,7 +90,7 @@ class KalshiPriceStore:
     Loaded-once index of historical Kalshi price data.
 
     Lifecycle:
-        store = KalshiPriceStore(data_dir="data").load()
+        store = KalshiPriceStore().load()
         # then pass store to BacktestEngine
 
     Lookup:
@@ -96,12 +99,12 @@ class KalshiPriceStore:
         # → empty list if no data for that (city, date)
     """
 
-    PRICE_FILE = "kalshi_price_history.csv"
     PRICE_MIN = 0.01
     PRICE_MAX = 0.99
+    MIN_VOLUME = 10  # skip candles with fewer than this many contracts traded
 
-    def __init__(self, data_dir: str = "data") -> None:
-        self._data_dir = Path(data_dir)
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self._db_path = Path(db_path)
         self._index: dict[tuple[str, date], list[Session]] = {}
         self._loaded = False
 
@@ -111,25 +114,34 @@ class KalshiPriceStore:
         self._n_indexed_pairs: int = 0
         self._n_skipped_parse: int = 0
         self._n_skipped_price: int = 0
+        self._n_skipped_volume: int = 0
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def load(self, verbose: bool = False) -> "KalshiPriceStore":
         """
-        Load kalshi_price_history.csv, validate it, and build the index.
-        Returns self for chaining.
+        Load Kalshi price history from the DB (kalshi_candles + kalshi_markets),
+        validate it, and build the index. Returns self for chaining.
         """
         from src.strategy import parse_contract
 
-        path = self._data_dir / self.PRICE_FILE
-        if not path.exists():
+        if not self._db_path.exists():
             raise FileNotFoundError(
-                f"{path} not found.\n"
-                "  Download it first:  python scripts/download_kalshi_history.py"
+                f"Database not found at {self._db_path}.\n"
+                "  Run scripts/update_data.py first."
             )
 
-        print(f"  Loading Kalshi price history: {path}")
-        df = pd.read_csv(path)
+        print(f"  Loading Kalshi price history from {self._db_path}...")
+        with get_db(self._db_path) as conn:
+            df = pd.read_sql(
+                """
+                SELECT c.ticker, m.title, m.city, m.settlement_date,
+                       c.ts, c.close_dollars, c.volume
+                FROM kalshi_candles c
+                JOIN kalshi_markets m ON c.ticker = m.ticker
+                """,
+                conn,
+            )
         self._n_raw_rows = len(df)
 
         self._validate_schema(df)
@@ -172,12 +184,12 @@ class KalshiPriceStore:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _validate_schema(self, df: pd.DataFrame) -> None:
-        required = {"ticker", "title", "city", "settlement_date", "ts", "close_dollars"}
+        required = {"ticker", "title", "city", "settlement_date", "ts", "close_dollars", "volume"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(
-                f"kalshi_price_history.csv is missing columns: {missing}\n"
-                "  Re-run:  python scripts/download_kalshi_history.py"
+                f"Kalshi price data is missing columns: {missing}\n"
+                "  Re-run:  python scripts/update_data.py --only kalshi"
             )
 
         n_dupes = int(df.duplicated(subset=["ticker", "ts"]).sum())
@@ -198,19 +210,67 @@ class KalshiPriceStore:
             .drop_duplicates(subset=["ticker", "ts"], keep="last")
             .copy()
         )
+
+        # Volume filter — thin candles have unreliable close prices
+        n_low_vol = int((df["volume"] < self.MIN_VOLUME).sum())
+        if n_low_vol:
+            self._n_skipped_volume = n_low_vol
+            df = df[df["volume"] >= self.MIN_VOLUME].copy()
+
         df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
 
-        # Snapshot date: convert Unix ts (UTC) → date (tz-naive)
-        df["snapshot_date"] = (
-            pd.to_datetime(df["ts"], unit="s", utc=True)
-            .dt.tz_convert(None)
-            .dt.date
-        )
+        # Snapshot date: convert UTC timestamp → local city date so that evening
+        # pre-settlement candles (e.g. 7 PM CT on Dec 31 = 1 AM UTC Jan 1) are
+        # not incorrectly excluded by a UTC-date comparison.
+        city_tz = self._load_city_timezones()
+        df["_tz"] = df["city"].map(city_tz).fillna("UTC")
+        snapshot_local: pd.Series = pd.Series(index=df.index, dtype="object")
+        for tz_str, grp in df.groupby("_tz"):
+            snapshot_local[grp.index] = (
+                pd.to_datetime(grp["ts"], unit="s", utc=True)
+                .dt.tz_convert(tz_str)
+                .dt.date
+            )
+        df["snapshot_date"] = snapshot_local
+        df = df.drop(columns=["_tz"])
 
         # Keep only pre-settlement candles (the actual trading window)
         df = df[df["snapshot_date"] < df["settlement_date"]].copy()
         self._n_tickers = df["ticker"].nunique()
         return df
+
+    def _load_city_timezones(self) -> dict[str, str]:
+        """Load city→timezone from stations.csv; fall back to hardcoded map."""
+        stations_path = Path(__file__).resolve().parent.parent / "data" / "stations.csv"
+        if stations_path.exists():
+            try:
+                stations = pd.read_csv(stations_path)
+                if {"city", "timezone"}.issubset(stations.columns):
+                    return stations.set_index("city")["timezone"].to_dict()
+            except Exception:
+                pass
+        return {
+            "New York":      "America/New_York",
+            "Chicago":       "America/Chicago",
+            "Phoenix":       "America/Phoenix",
+            "Miami":         "America/New_York",
+            "Denver":        "America/Denver",
+            "Atlanta":       "America/New_York",
+            "Los Angeles":   "America/Los_Angeles",
+            "Houston":       "America/Chicago",
+            "Austin":        "America/Chicago",
+            "Philadelphia":  "America/New_York",
+            "Washington DC": "America/New_York",
+            "Las Vegas":     "America/Los_Angeles",
+            "Oklahoma City": "America/Chicago",
+            "San Francisco": "America/Los_Angeles",
+            "Seattle":       "America/Los_Angeles",
+            "Dallas":        "America/Chicago",
+            "New Orleans":   "America/Chicago",
+            "Boston":        "America/New_York",
+            "Minneapolis":   "America/Chicago",
+            "San Antonio":   "America/Chicago",
+        }
 
     def _build_index(self, df: pd.DataFrame, parse_contract, verbose: bool) -> None:
         """
@@ -239,6 +299,7 @@ class KalshiPriceStore:
                     title=str(row["title"]),
                     contract_def=contract_def,
                     close_dollars=float(row["close_dollars"]),
+                    volume=float(row["volume"]),
                 )
                 sessions_map.setdefault(int(row["ts"]), []).append(pc)
 
@@ -258,5 +319,6 @@ class KalshiPriceStore:
             f"{self._n_tickers} tickers | "
             f"{self._n_indexed_pairs} (city, date) pairs | "
             f"{n_cities} cities | "
-            f"{self._n_skipped_parse} contracts skipped (unparseable title)"
+            f"{self._n_skipped_parse} skipped (unparseable title) | "
+            f"{self._n_skipped_volume} skipped (volume < {self.MIN_VOLUME})"
         )

@@ -32,6 +32,7 @@ import json
 import time
 import warnings
 from dataclasses import dataclass
+from typing import Optional
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -69,6 +70,8 @@ class TuneConfig:
     max_daily_trades: int = 4
     max_session_trades: int = 4
     min_train_rows: int = 365
+    max_bet_dollars: Optional[float] = None  # hard dollar cap per trade (None = no cap)
+    fee_rate: float = 0.02                   # Kalshi fee fraction on winnings
 
 
 # ── Hyperparameter search spaces ──────────────────────────────────────────────
@@ -79,14 +82,19 @@ class TuneConfig:
 
 _SHARED_PARAMS = [
     # Training
-    ("lookback",       "int",    180, 2500),   # rows of history to train on
+    ("lookback",        "int",    180, 2500),   # rows of history to train on
     # Sizing
-    ("kelly_fraction", "linear", 0.05,  1.0),
-    ("max_bet_frac",   "linear", 0.01,  0.20),
+    ("kelly_fraction",  "linear", 0.05,  1.0),
+    ("max_bet_frac",    "linear", 0.01,  0.20),
     # Edge
-    ("min_edge",       "linear", 0.00,  0.15),
+    ("min_edge",        "linear", 0.00,  0.15),
+    # Confidence — model must be >= 0.5 + min_confidence certain; controls win rate
+    ("min_confidence",  "linear", 0.00,  0.35),
     # Uncertainty — widens model's predictive sigma on high-spread days
-    ("spread_alpha",   "linear", 0.00,  1.00),
+    ("spread_alpha",    "linear", 0.00,  1.00),
+    # Probability band — skip near-certain outcomes
+    ("min_fair_p",      "linear", 0.02,  0.20),
+    ("max_fair_p",      "linear", 0.80,  0.98),
 ]
 
 SEARCH_SPACES = {
@@ -234,8 +242,7 @@ def make_model(model_name: str, params: dict):
             m._model = br
         else:
             m = InteractionBayesModel()
-            # InteractionBayesModel uses a Pipeline; replace the last step
-            m._model.steps[-1] = ("bayesianridge", br)
+            m._model = br
 
     elif model_name == "ARD":
         from sklearn.linear_model import ARDRegression
@@ -271,7 +278,7 @@ def make_model(model_name: str, params: dict):
 
     elif model_name == "GBResidual":
         m = GBResidualModel(
-            n_estimators=int(params.get("n_estimators", 100)),
+            max_iter=int(params.get("n_estimators", 100)),
             max_depth=int(params.get("max_depth", 4)),
         )
 
@@ -312,7 +319,7 @@ def evaluate_params(
 ) -> "tuple[float, dict] | tuple[float, dict, RunResult]":
     """
     Build a BacktestConfig from trial params, run one backtest via
-    BacktestEngine, and return (roi, per_year_roi_dict).
+    BacktestEngine, and return (total_pnl, per_year_pnl_dict).
 
     spread_alpha is patched at the src.model module level so it affects
     the model's aleatoric sigma computation. Always restored in finally.
@@ -327,7 +334,12 @@ def evaluate_params(
             lookback=int(params.get("lookback", 730)),
             kelly_fraction=float(params.get("kelly_fraction", 0.33)),
             max_bet_fraction=float(params.get("max_bet_frac", 0.05)),
+            max_bet_dollars=tune_cfg.max_bet_dollars,
             min_edge=float(params.get("min_edge", 0.05)),
+            min_confidence=float(params.get("min_confidence", 0.0)),
+            min_fair_p=float(params.get("min_fair_p", 0.05)),
+            max_fair_p=float(params.get("max_fair_p", 0.95)),
+            fee_rate=tune_cfg.fee_rate,
             n_runs=1,
             seed=42,
             start_date=tune_cfg.start_date,
@@ -350,27 +362,24 @@ def evaluate_params(
         results = engine.run()
     except Exception:
         empty = ({},)
-        return (-1.0, *empty, None) if return_run else (-1.0, {})
+        return (-np.inf, *empty, None) if return_run else (-np.inf, {})
     finally:
         _mmod.SPREAD_ALPHA = orig_spread
 
     run = results.runs[0]
-    year_rois = _year_rois(run.trades)
+    year_pnls = _year_pnls(run.trades)
     if return_run:
-        return run.roi, year_rois, run
-    return run.roi, year_rois
+        return run.total_pnl, year_pnls, run
+    return run.total_pnl, year_pnls
 
 
-def _year_rois(trades: pd.DataFrame) -> dict:
+def _year_pnls(trades: pd.DataFrame) -> dict:
+    """Return absolute PnL per calendar year."""
     if trades.empty:
         return {}
     trades = trades.copy()
     trades["year"] = pd.to_datetime(trades["date"]).dt.year
-    result = {}
-    for yr, grp in trades.groupby("year"):
-        w = grp["size"].sum()
-        result[int(yr)] = float(grp["pnl"].sum() / w) if w > 0 else 0.0
-    return result
+    return {int(yr): float(grp["pnl"].sum()) for yr, grp in trades.groupby("year")}
 
 
 # ── Bayesian Optimization loop ────────────────────────────────────────────────
@@ -387,7 +396,7 @@ def run_bo(
 ) -> dict:
     """
     Run Bayesian Optimization for model_name.
-    Returns dict: {best_params, best_roi, history}.
+    Returns dict: {best_params, best_pnl, history}.
     """
     space = SEARCH_SPACES[model_name]
     d = len(space)
@@ -414,7 +423,7 @@ def run_bo(
         f"sessions/day={'all' if tune_cfg.sessions_per_day == 0 else tune_cfg.sessions_per_day}"
     )
     print(sep)
-    print(f"{'iter':>4}  {'roi':>8}  {'best':>8}  params")
+    print(f"{'iter':>4}  {'pnl':>10}  {'best':>10}  params")
     print("-" * 64)
 
     for it in range(n_iter):
@@ -432,46 +441,40 @@ def run_bo(
 
         params = decode(x_next, space)
         t0 = time.time()
-        roi, year_rois = evaluate_params(model_name, params, dataset, price_store, tune_cfg)
+        pnl, year_pnls = evaluate_params(model_name, params, dataset, price_store, tune_cfg)
         elapsed = time.time() - t0
 
         if it >= n_init:
             X_obs = np.vstack([X_obs, x_next])
-            y_obs = np.append(y_obs, roi)
+            y_obs = np.append(y_obs, pnl)
         else:
-            y_obs[it] = roi
+            y_obs[it] = pnl
 
-        history.append({"params": params, "roi": roi})
-        best_roi = float(np.nanmax(y_obs))
+        history.append({"params": params, "pnl": pnl})
+        best_pnl = float(np.nanmax(y_obs))
         params_str = "  ".join(f"{k}={v:.4g}" for k, v in params.items())
-        print(f"{it+1:>4}  {roi:>8.4f}  {best_roi:>8.4f}  {params_str}  ({elapsed:.0f}s)")
+        print(f"{it+1:>4}  {pnl:>10.2f}  {best_pnl:>10.2f}  {params_str}  ({elapsed:.0f}s)")
 
-        if year_rois:
-            yr_vals = list(year_rois.values())
-            yr_str = "  ".join(f"{yr}:{r:.3f}" for yr, r in sorted(year_rois.items()))
-            print(
-                f"      per-year → {yr_str}  "
-                f"[mean:{np.mean(yr_vals):.3f}  "
-                f"std:{np.std(yr_vals):.3f}  "
-                f"min:{np.min(yr_vals):.3f}]"
-            )
+        if year_pnls:
+            yr_str = "  ".join(f"{yr}:${p:.2f}" for yr, p in sorted(year_pnls.items()))
+            print(f"      per-year → {yr_str}")
 
     best_idx = int(np.nanargmax(y_obs))
     best_params = history[best_idx]["params"]
-    best_roi = history[best_idx]["roi"]
+    best_pnl = history[best_idx]["pnl"]
 
-    print(f"\nBest ROI: {best_roi:.4f}")
+    print(f"\nBest PnL: ${best_pnl:.2f}")
     print("Best params:")
     for k, v in best_params.items():
         print(f"  {k:<20} {v:.6g}")
 
     valid = np.array([r for r in y_obs if np.isfinite(r)])
-    print(f"\n=== ROI distribution across {len(valid)} evals ===")
+    print(f"\n=== PnL distribution across {len(valid)} evals ===")
     for label, p in [("min", 0), ("p25", 25), ("p50", 50), ("p75", 75), ("p90", 90), ("max", 100)]:
-        print(f"  {label}:  {np.percentile(valid, p):.4f}")
-    print(f"  mean:  {valid.mean():.4f}  |  std: {valid.std():.4f}  |  % > 0: {(valid > 0).mean():.1%}")
+        print(f"  {label}:  ${np.percentile(valid, p):.2f}")
+    print(f"  mean: ${valid.mean():.2f}  |  std: ${valid.std():.2f}  |  % > 0: {(valid > 0).mean():.1%}")
 
-    return {"best_params": best_params, "best_roi": best_roi, "history": history}
+    return {"best_params": best_params, "best_pnl": best_pnl, "history": history}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -536,14 +539,14 @@ def main() -> None:
 
     # ── Load data once — shared across all trials and all models ──────────────
     print("Loading Kalshi price history...")
-    price_store = KalshiPriceStore(data_dir="data").load()
+    price_store = KalshiPriceStore().load()
     print(price_store.coverage_summary())
 
     print("\nLoading feature data...")
     bootstrap_cfg = BacktestConfig(model_name="BayesianRidge",
                                    start_date=tune_cfg.start_date,
                                    end_date=tune_cfg.end_date)
-    dataset = DataLoader(data_dir="data").load(bootstrap_cfg, skip_validation=args.no_validate)
+    dataset = DataLoader().load(bootstrap_cfg, skip_validation=args.no_validate)
 
     Path("logs").mkdir(exist_ok=True)
     all_results = {}
@@ -561,12 +564,12 @@ def main() -> None:
         )
         all_results[model_name] = {
             "best_params": result["best_params"],
-            "best_roi": result["best_roi"],
+            "best_pnl": result["best_pnl"],
         }
 
         # Save trade log for the winning params
         print(f"\nReplaying best params for {model_name}...")
-        roi, _, best_run = evaluate_params(
+        pnl, _, best_run = evaluate_params(
             model_name, result["best_params"], dataset, price_store, tune_cfg,
             return_run=True,
         )
@@ -576,7 +579,7 @@ def main() -> None:
             win_rate = (best_run.trades["pnl"] > 0).mean()
             print(
                 f"  Trades → {trades_path}  "
-                f"({len(best_run.trades)} trades, {win_rate:.1%} win, ROI={roi:.4f})"
+                f"({len(best_run.trades)} trades, {win_rate:.1%} win, PnL=${pnl:.2f})"
             )
 
     # Merge into the shared JSON (preserves results from previous tuning runs)
@@ -591,9 +594,9 @@ def main() -> None:
     print(f"\nBest params → {out_path}")
 
     if len(models_to_run) > 1:
-        print("\n=== Summary (ranked by ROI) ===")
-        for name, r in sorted(all_results.items(), key=lambda x: -x[1]["best_roi"]):
-            print(f"  {name:<20}  ROI={r['best_roi']:.4f}")
+        print("\n=== Summary (ranked by PnL) ===")
+        for name, r in sorted(all_results.items(), key=lambda x: -x[1]["best_pnl"]):
+            print(f"  {name:<20}  PnL=${r['best_pnl']:.2f}")
 
 
 if __name__ == "__main__":

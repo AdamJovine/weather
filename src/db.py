@@ -54,9 +54,10 @@ DB_PATH = Path("data/weather.db")
 
 # (table, date_sql, max_age_days, label)
 _FRESHNESS_CHECKS = [
-    ("weather_daily",   "MAX(date)",                           3,  "NOAA TMAX"),
+    ("weather_daily",   "MAX(date)",                           6,  "NOAA TMAX"),
     ("forecasts_daily", "MAX(date)",                           2,  "OpenMeteo GFS"),
     ("gefs_spread",     "MAX(date)",                           2,  "GEFS spread"),
+    ("nws_forecasts",   "MAX(target_date)",                    2,  "NWS forecasts"),
     ("mjo_daily",       "MAX(date)",                           5,  "MJO"),
     ("climate_monthly", "MAX(year || printf('%02d', month))",  50, "Climate indices"),
 ]
@@ -78,6 +79,9 @@ CREATE TABLE IF NOT EXISTS forecasts_daily (
     ensemble_spread     REAL,
     ecmwf_minus_gfs     REAL,
     precip_forecast     REAL,
+    temp_850hpa         REAL,
+    shortwave_radiation REAL,
+    dew_point_max       REAL,
     PRIMARY KEY (city, date)
 );
 
@@ -129,6 +133,20 @@ CREATE TABLE IF NOT EXISTS kalshi_candles (
 );
 
 CREATE INDEX IF NOT EXISTS idx_kalshi_candles_ticker ON kalshi_candles (ticker);
+
+CREATE TABLE IF NOT EXISTS kalshi_no_candles (
+    ticker     TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (ticker)
+);
+
+CREATE TABLE IF NOT EXISTS nws_forecasts (
+    city          TEXT NOT NULL,
+    target_date   TEXT NOT NULL,
+    forecast_high REAL,
+    nbm_high      REAL,
+    PRIMARY KEY (city, target_date)
+);
 """
 
 
@@ -165,7 +183,22 @@ def get_db(path: Path | str = DB_PATH):
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     conn.commit()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add new columns to existing tables without recreating them."""
+    new_cols = [
+        ("forecasts_daily", "temp_850hpa",         "REAL"),
+        ("forecasts_daily", "shortwave_radiation",  "REAL"),
+        ("forecasts_daily", "dew_point_max",        "REAL"),
+    ]
+    for table, col, dtype in new_cols:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 # ─── Write ────────────────────────────────────────────────────────────────────
@@ -286,39 +319,3 @@ def check_freshness_db(conn: sqlite3.Connection) -> list:
         results.append(r)
     return results
 
-
-# ─── One-time CSV migration ───────────────────────────────────────────────────
-
-def migrate_from_csvs(conn: sqlite3.Connection, data_dir: Path = Path("data")) -> None:
-    """
-    Read every existing CSV file and upsert its rows into the corresponding
-    table.  Safe to run multiple times — INSERT OR REPLACE deduplicates.
-    """
-    migrations: list[tuple[Path, str | None]] = [
-        (data_dir / "historical_tmax.csv",                      "weather_daily"),
-        (data_dir / "forecasts/openmeteo_forecast_history.csv", "forecasts_daily"),
-        (data_dir / "forecasts/gefs_spread.csv",                "gefs_spread"),
-        (data_dir / "climate_indices.csv",                      "climate_monthly"),
-        (data_dir / "mjo_indices.csv",                          "mjo_daily"),
-        (data_dir / "kalshi_price_history.csv",                 None),   # split
-    ]
-
-    for path, table in migrations:
-        if not path.exists():
-            print(f"  SKIP  {path}  (not found)")
-            continue
-
-        df = pd.read_csv(path)
-
-        if path.name == "kalshi_price_history.csv":
-            market_cols = ["ticker", "title", "series", "city", "settlement_date"]
-            candle_cols = ["ticker", "ts", "close_dollars", "volume"]
-            markets_df  = df[market_cols].drop_duplicates(subset=["ticker"])
-            candles_df  = df[candle_cols]
-            n_m = upsert_df(conn, "kalshi_markets", markets_df)
-            n_c = upsert_df(conn, "kalshi_candles", candles_df)
-            print(f"  OK    {path.name}  →  kalshi_markets ({n_m} markets) "
-                  f"+ kalshi_candles ({n_c} candles)")
-        else:
-            n = upsert_df(conn, table, df)
-            print(f"  OK    {path.name}  →  {table} ({n} rows)")

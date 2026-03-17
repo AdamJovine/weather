@@ -9,8 +9,13 @@ Build one modeling table: one row per (city, date) with:
   - climatology features
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+warnings.filterwarnings("ignore", "Downcasting object dtype arrays", FutureWarning)
 
 
 _EPOCH = pd.Timestamp("2018-01-01")
@@ -29,8 +34,16 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_MAX_LAG_GAP_DAYS = 7   # gaps larger than this mean lags are from a stale regime
+
+
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["city", "date"]).copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Days since the previous row (within city) — used to detect stale lags
+    df["_date_gap"] = df.groupby("city")["date"].diff().dt.days
+
     shifted = df.groupby("city")["y_tmax"].shift(1)
     df["lag1_tmax"] = shifted
     df["lag3_mean_tmax"] = (
@@ -51,6 +64,21 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     # Rising/falling trend: yesterday vs the recent 7-day mean.
     # Positive = warming into the bet date; negative = cooling.
     df["lag_trend"] = df["lag1_tmax"] - df["lag7_mean_tmax"]
+
+    # Nullify lag features for any row whose predecessor is more than
+    # _MAX_LAG_GAP_DAYS away.  Without this, live prediction rows (where
+    # recent NOAA data hasn't been ingested yet) inherit stale lags from
+    # the last available historical row — potentially months old and from
+    # a completely different seasonal regime.  The build_feature_table()
+    # caller then imputes NaN lags with climo_mean_doy, which is correct.
+    stale = df["_date_gap"].isna() | (df["_date_gap"] > _MAX_LAG_GAP_DAYS)
+    lag_cols = ["lag1_tmax", "lag3_mean_tmax", "lag7_mean_tmax",
+                "lag14_mean_tmax", "lag21_mean_tmax", "lag30_mean_tmax",
+                "lag_trend"]
+    for col in lag_cols:
+        df.loc[stale, col] = float("nan")
+
+    df = df.drop(columns=["_date_gap"])
     return df
 
 
@@ -193,7 +221,8 @@ def build_feature_table(
         gfs["date"] = pd.to_datetime(gfs["date"])
         merge_cols = ["city", "date", "forecast_high_gfs"]
         for optional in ("ensemble_spread", "forecast_high_ecmwf",
-                         "ecmwf_minus_gfs", "precip_forecast"):
+                         "ecmwf_minus_gfs", "precip_forecast",
+                         "temp_850hpa", "shortwave_radiation", "dew_point_max"):
             if optional in gfs.columns:
                 merge_cols.append(optional)
         df = df.merge(gfs[merge_cols], on=["city", "date"], how="left")
@@ -211,7 +240,8 @@ def build_feature_table(
     # available the *previous* day — a genuine day-ahead signal.
     _gfs_cols = [c for c in ("forecast_high", "ensemble_spread",
                               "forecast_high_ecmwf", "ecmwf_minus_gfs",
-                              "precip_forecast") if c in df.columns]
+                              "precip_forecast", "temp_850hpa",
+                              "shortwave_radiation", "dew_point_max") if c in df.columns]
     for col in _gfs_cols:
         df[col] = df.groupby("city")[col].shift(1)
 
@@ -289,6 +319,36 @@ def build_feature_table(
     city_month_precip = df.groupby(["city", "month"])["precip_forecast"].transform("median")
     df["precip_forecast"] = df["precip_forecast"].fillna(city_month_precip).fillna(0.0)
 
+    # 850hPa temperature (°F daily max). Impute with per-city-month median.
+    if "temp_850hpa" not in df.columns:
+        df["temp_850hpa"] = np.nan
+    city_month_850 = df.groupby(["city", "month"])["temp_850hpa"].transform("median")
+    df["temp_850hpa"] = (
+        df["temp_850hpa"]
+        .fillna(city_month_850)
+        .fillna(df["climo_mean_doy"] - 20.0)
+        .fillna(df["forecast_high"] - 20.0)
+        .fillna(30.0)
+    )
+
+    # Shortwave radiation sum (MJ/m²/day). Impute with per-city-month median.
+    if "shortwave_radiation" not in df.columns:
+        df["shortwave_radiation"] = np.nan
+    city_month_sw = df.groupby(["city", "month"])["shortwave_radiation"].transform("median")
+    df["shortwave_radiation"] = df["shortwave_radiation"].fillna(city_month_sw).fillna(0.0)
+
+    # Dew point daily max (°F). Impute with per-city-month median.
+    if "dew_point_max" not in df.columns:
+        df["dew_point_max"] = np.nan
+    city_month_dp = df.groupby(["city", "month"])["dew_point_max"].transform("median")
+    df["dew_point_max"] = (
+        df["dew_point_max"]
+        .fillna(city_month_dp)
+        .fillna(df["climo_mean_doy"] - 25.0)
+        .fillna(df["forecast_high"] - 25.0)
+        .fillna(20.0)
+    )
+
     # GEFS ensemble spread (std of 31 GEFS members).
     # Available from Dec 2022 onward; impute older dates with 3-model ensemble_spread.
     if gefs_df is not None:
@@ -314,5 +374,21 @@ def build_feature_table(
             df[col] = 0.0
         else:
             df[col] = df[col].fillna(0.0)
+
+    # Trailing 14-day mean NWS signed forecast error per city.
+    # At date T: mean(forecast_high[D] - y_tmax[D]) for D in [T-14, T-1].
+    # forecast_high is already day-ahead aligned (shifted above), so
+    # forecast_high[D] - y_tmax[D] is the GFS/NWS error for day D.
+    # shift(1) inside the rolling ensures day T only sees errors through T-1.
+    # Rows where y_tmax is NaN (future dates) contribute NaN errors, which
+    # rolling() ignores; min_periods=3 keeps the feature defined early in history.
+    df = df.sort_values(["city", "date"]).reset_index(drop=True)
+    _nws_error = df["forecast_high"] - df["y_tmax"]
+    df["nws_bias_14d"] = (
+        df.assign(_e=_nws_error)
+        .groupby("city")["_e"]
+        .transform(lambda s: s.shift(1).rolling(14, min_periods=3).mean())
+        .fillna(0.0)
+    )
 
     return df

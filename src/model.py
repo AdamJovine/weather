@@ -56,24 +56,11 @@ FEATURES = [
     "lag30_mean_tmax",        # 30-day rolling mean — monthly regime persistence
     "lag_trend",              # lag1 - lag7_mean: recent warming (+) or cooling (-) trend
     "forecast_minus_lag1",    # NWS forecast minus yesterday's obs — warm/cold-front signal
-    "days_since_2018",        # linear warming trend signal across the dataset period
-    "doy_sin",
-    "doy_cos",
-    "doy_sin2",               # 2nd harmonic — captures bimodal seasonal variance patterns
-    "doy_cos2",
-    "ensemble_spread",        # std of GFS/ICON/ECMWF forecasts — high = uncertain day
-    "ecmwf_minus_gfs",        # signed model disagreement: ECMWF warmer (+) or cooler (-) than GFS
-    "precip_forecast",        # GFS precipitation (mm): dry days → higher tmax
-    "ao_index",               # Arctic Oscillation — negative = cold-air-outbreak regime
-    "nao_index",              # North Atlantic Oscillation — affects East Coast / Midwest temps
-    "oni",                    # Oceanic Niño Index — positive = El Niño, negative = La Niña
-    "pna_index",              # Pacific/North American Pattern — positive = warm West / cold East
-    "pdo_index",              # Pacific Decadal Oscillation — modulates ENSO impact on US temps
-    "mjo_amplitude",          # MJO strength: sqrt(RMM1²+RMM2²); >1 = active oscillation
-    "mjo_phase_sin",          # sin(2π×(phase−1)/8) — cyclical MJO phase encoding
-    "mjo_phase_cos",          # cos(2π×(phase−1)/8) — cyclical MJO phase encoding
     "nbm_high",               # NBM gridded max temp (NWS /gridpoints); imputed from forecast_high when missing
-    "gefs_spread",            # std of 31 GEFS ensemble members; imputed from ensemble_spread before Dec 2022
+    "temp_850hpa",            # GFS 850hPa temperature daily max (°F) — upper-air thermal regime
+    "shortwave_radiation",    # GFS shortwave radiation sum (MJ/m²/day) — inversely correlated with cloud cover → tmax
+    "dew_point_max",          # GFS 2m dew point daily max (°F) — moisture cap on afternoon heating
+    "nws_bias_14d",           # trailing 14-day mean signed NWS error (°F); positive = NWS running warm
 ]
 
 SPREAD_ALPHA = 0.3   # how much ensemble_spread widens the aleatoric sigma
@@ -137,8 +124,13 @@ class _BaseTempModel:
         if temp_grid is None:
             temp_grid = range(TEMP_GRID_MIN, TEMP_GRID_MAX + 1)
 
-        mu, epistemic, aleatoric = self.predict_with_uncertainty(df)
-        total_sigma = np.sqrt(epistemic**2 + aleatoric**2)
+        mu, _epistemic, aleatoric = self.predict_with_uncertainty(df)
+        # Use only the aleatoric sigma (empirically calibrated from training
+        # residuals + ensemble spread) to set the distribution width.
+        # Epistemic (weight posterior uncertainty) inflates badly when
+        # prediction features are out-of-distribution, producing a flat
+        # useless distribution.  Epistemic is reserved for Thompson Sampling.
+        total_sigma = aleatoric
 
         rows = []
         for i, (m, s) in enumerate(zip(mu, total_sigma)):
@@ -479,10 +471,10 @@ class QuantileGBModel(_BaseTempModel):
     aleatoric is computed from training residuals as usual.
     """
 
-    def __init__(self, max_iter: int = 80):
-        self._m_lo = HistGradientBoostingRegressor(loss="quantile", quantile=0.16, max_iter=max_iter)
-        self._m_mu = HistGradientBoostingRegressor(loss="squared_error", max_iter=max_iter)
-        self._m_hi = HistGradientBoostingRegressor(loss="quantile", quantile=0.84, max_iter=max_iter)
+    def __init__(self, max_iter: int = 30, max_depth: int = 3):
+        self._m_lo = HistGradientBoostingRegressor(loss="quantile", quantile=0.16, max_iter=max_iter, max_depth=max_depth)
+        self._m_mu = HistGradientBoostingRegressor(loss="squared_error", max_iter=max_iter, max_depth=max_depth)
+        self._m_hi = HistGradientBoostingRegressor(loss="quantile", quantile=0.84, max_iter=max_iter, max_depth=max_depth)
 
     def fit(self, df: pd.DataFrame) -> "QuantileGBModel":
         X, y, sw = self._fit_core(df)
@@ -538,17 +530,20 @@ class BaggingRidgeModel(_BaseTempModel):
 
 class GBResidualModel(_BaseTempModel):
     """
-    Two-stage GradientBoosting:
+    Two-stage Histogram Gradient Boosting:
       Stage 1: predict temperature mean (mu).
       Stage 2: predict |residual| from stage 1 — gives per-row noise scale.
+
+    Uses HistGradientBoostingRegressor (histogram-based, 10-50× faster than
+    the sequential GradientBoostingRegressor on typical dataset sizes here).
 
     epistemic_std = 0.5 × predicted_abs_residual  (uncertainty in the mean estimate)
     aleatoric     = predicted_abs_residual × spread_scale
     """
 
-    def __init__(self, n_estimators: int = 100, max_depth: int = 4):
-        self._model_mu    = GradientBoostingRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
-        self._model_sigma = GradientBoostingRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
+    def __init__(self, max_iter: int = 30, max_depth: int = 3):
+        self._model_mu    = HistGradientBoostingRegressor(max_iter=max_iter, max_depth=max_depth, random_state=42)
+        self._model_sigma = HistGradientBoostingRegressor(max_iter=max_iter, max_depth=max_depth, random_state=42)
 
     def fit(self, df: pd.DataFrame) -> "GBResidualModel":
         X, y, sw = self._fit_core(df)

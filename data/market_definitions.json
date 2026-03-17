@@ -1,0 +1,10 @@
+[
+  {
+    "market_ticker": "FILL_ME_IN",
+    "city": "New York",
+    "station_id": "USW00094728",
+    "settlement_source": "NOAA GHCN-Daily TMAX",
+    "timezone": "America/New_York",
+    "rounding_rule": "nearest_int"
+  }
+]

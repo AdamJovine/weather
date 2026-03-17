@@ -1,0 +1,9 @@
+pandas
+numpy
+requests
+scikit-learn
+scipy
+python-dotenv
+matplotlib
+kalshi_python_sync
+ngboost

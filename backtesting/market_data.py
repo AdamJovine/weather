@@ -33,7 +33,10 @@ from typing import Optional
 
 import pandas as pd
 
+from src.app_config import cfg as _cfg
 from src.db import DB_PATH, get_db
+
+_md = _cfg.market_data
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class ParsedContract:
     contract_def: dict          # immutable after creation (use dict but treat as read-only)
     close_dollars: float        # real last-traded price in (0.01, 0.99)
     volume: float = 0.0         # contracts traded in this candle period
+    high_dollars: Optional[float] = None   # intra-candle YES high (for pessimistic pricing)
+    low_dollars: Optional[float] = None    # intra-candle YES low  (for pessimistic pricing)
 
     @property
     def contract_type(self) -> str:
@@ -99,9 +104,9 @@ class KalshiPriceStore:
         # → empty list if no data for that (city, date)
     """
 
-    PRICE_MIN = 0.01
-    PRICE_MAX = 0.99
-    MIN_VOLUME = 10  # skip candles with fewer than this many contracts traded
+    PRICE_MIN  = _md.price_min
+    PRICE_MAX  = _md.price_max
+    MIN_VOLUME = _md.min_volume  # skip candles with fewer than this many contracts traded
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -136,7 +141,8 @@ class KalshiPriceStore:
             df = pd.read_sql(
                 """
                 SELECT c.ticker, m.title, m.city, m.settlement_date,
-                       c.ts, c.close_dollars, c.volume
+                       c.ts, c.close_dollars, c.volume,
+                       c.high_dollars, c.low_dollars
                 FROM kalshi_candles c
                 JOIN kalshi_markets m ON c.ticker = m.ticker
                 """,
@@ -300,6 +306,8 @@ class KalshiPriceStore:
                     contract_def=contract_def,
                     close_dollars=float(row["close_dollars"]),
                     volume=float(row["volume"]),
+                    high_dollars=float(row["high_dollars"]) if pd.notna(row.get("high_dollars")) else None,
+                    low_dollars=float(row["low_dollars"])   if pd.notna(row.get("low_dollars"))  else None,
                 )
                 sessions_map.setdefault(int(row["ts"]), []).append(pc)
 

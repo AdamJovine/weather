@@ -69,13 +69,14 @@ import tune_hyperparams as th
 from backtesting.config import BacktestConfig
 from backtesting.data_loader import DataLoader
 from backtesting.market_data import KalshiPriceStore
+from src.app_config import cfg as _cfg
 
 warnings.filterwarnings("ignore")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-TIMEOUT_SECS   = 900       # blacklist model if single eval > 15 min
-OUT_ROOT       = Path("logs/mega_tune")
+TIMEOUT_SECS = _cfg.mega_tune.timeout_secs
+OUT_ROOT     = Path(_cfg.paths.tune_output)
 
 
 # EvalConfig is an alias for th.TuneConfig — kept for readability in this file.
@@ -210,7 +211,7 @@ def save_blacklisted(state: ModelState, reason: str) -> None:
 
 
 def save_progress(states: list[ModelState], n_rounds_done: int,
-                  n_rounds_total: int) -> None:
+                  n_rounds_total: int, run_dir: Path) -> None:
     rows = []
     for s in states:
         valid = s.y_obs[:s.n_evals][np.isfinite(s.y_obs[:s.n_evals])]
@@ -228,11 +229,11 @@ def save_progress(states: list[ModelState], n_rounds_done: int,
         "rounds_total":   n_rounds_total,
         "models":         rows,
     }
-    with open(OUT_ROOT / "progress.json", "w") as f:
+    with open(run_dir / "progress.json", "w") as f:
         json.dump(doc, f, indent=2)
 
 
-def save_summary(states: list[ModelState]) -> None:
+def save_summary(states: list[ModelState], run_dir: Path) -> None:
     rows = []
     for s in states:
         valid = s.y_obs[:s.n_evals][np.isfinite(s.y_obs[:s.n_evals])]
@@ -248,7 +249,7 @@ def save_summary(states: list[ModelState]) -> None:
                              for k, v in s.best_params.items()},
         })
     rows.sort(key=lambda r: (r["best_pnl"] or -999), reverse=True)
-    with open(OUT_ROOT / "summary.json", "w") as f:
+    with open(run_dir / "summary.json", "w") as f:
         json.dump(rows, f, indent=2)
 
 
@@ -279,24 +280,30 @@ def wait_for_update_data(poll_secs: int = 30) -> None:
 # dataset and price_store are large; initialise them once per worker process
 # so they aren't re-pickled on every trial submission.
 
-_w_dataset    = None
+_w_dataset     = None
 _w_price_store = None
-_w_eval_cfg   = None
+_w_eval_cfg    = None
+_w_trades_dir  = None   # root dir under which trades CSVs are written per trial
 
 
-def _worker_init(dataset, price_store, eval_cfg) -> None:
-    global _w_dataset, _w_price_store, _w_eval_cfg
+def _worker_init(dataset, price_store, eval_cfg, trades_dir) -> None:
+    global _w_dataset, _w_price_store, _w_eval_cfg, _w_trades_dir
     _w_dataset     = dataset
     _w_price_store = price_store
     _w_eval_cfg    = eval_cfg
+    _w_trades_dir  = trades_dir
 
 
-def _worker_call(model_name: str, params: dict) -> tuple[float, dict, float]:
+def _worker_call(model_name: str, params: dict, trial_num: int) -> tuple[float, dict, float]:
     """Run one trial in a worker process. Returns (pnl, year_pnls, elapsed_s)."""
     t0 = time.time()
-    pnl, year_pnls = th.evaluate_params(
+    pnl, year_pnls, run = th.evaluate_params(
         model_name, params, _w_dataset, _w_price_store, _w_eval_cfg,
+        return_run=True,
     )
+    if _w_trades_dir is not None and run is not None and not run.trades.empty:
+        out = Path(_w_trades_dir) / model_name / f"trial_{trial_num:04d}_trades.csv"
+        run.trades.to_csv(out, index=False)
     return pnl, year_pnls, time.time() - t0
 
 
@@ -310,15 +317,16 @@ def run_mega_tune(
     n_rounds:    int,
     n_init:      int,
     rng:         np.random.Generator,
+    run_dir:     Path,
     n_jobs:      int = 4,
     start_round: int = 0,
 ) -> None:
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     with ProcessPoolExecutor(
         max_workers=n_jobs,
         initializer=_worker_init,
-        initargs=(dataset, price_store, eval_cfg),
+        initargs=(dataset, price_store, eval_cfg, run_dir),
     ) as pool:
         for round_idx in range(start_round, n_rounds):
             active = [m for m in models if m.is_active]
@@ -343,7 +351,7 @@ def run_mega_tune(
                 params_str = "  ".join(f"{k}={v:.4g}" for k, v in params.items())
                 print(f"  [{state.name}] trial {state.n_evals + 1}  ({phase})")
                 print(f"    {params_str}", flush=True)
-                future = pool.submit(_worker_call, state.name, params)
+                future = pool.submit(_worker_call, state.name, params, state.n_evals + 1)
                 submissions.append((future, state, x_next, params))
 
             # Collect results as workers finish (order may differ from submission)
@@ -385,8 +393,8 @@ def run_mega_tune(
                     print(f"             per-year: {yr_str}", flush=True)
 
             # ── after every round: flush progress and summary to disk ──────
-            save_progress(models, round_idx + 1, n_rounds)
-            save_summary(models)
+            save_progress(models, round_idx + 1, n_rounds, run_dir)
+            save_summary(models, run_dir)
 
     sep = "=" * 70
     print(f"\n{sep}")
@@ -400,7 +408,7 @@ def run_mega_tune(
         print(f"  {i:>2}. {m.name:<18}  best=${m.best_pnl:+.2f}  "
               f"mean=${valid.mean():+.2f}  evals={m.n_evals}{flag}")
     print(sep)
-    print(f"\n  Results → {OUT_ROOT}/")
+    print(f"\n  Results → {run_dir}/")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -415,23 +423,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--models", nargs="+", default=None,
                    choices=sorted(th.SEARCH_SPACES.keys()), metavar="MODEL",
                    help="Subset of models to tune. Default: all.")
-    p.add_argument("--n-rounds", type=int, default=50,
-                   help="Total BO rounds (each model gets one eval per round). [50]")
-    p.add_argument("--n-init", type=int, default=10,
-                   help="Random init rounds before GP-EI kicks in. [10]")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--start", default="2025-12-01", metavar="YYYY-MM-DD",
-                   help="Backtest window start. [2025-12-01]")
-    p.add_argument("--end",   default="2026-03-15", metavar="YYYY-MM-DD",
-                   help="Backtest window end.   [2026-03-15]")
-    p.add_argument("--max-bet-dollars", type=float, default=10.0, metavar="$",
-                   help="Hard dollar cap per trade per session. [10]")
-    p.add_argument("--max-session-trades", type=int, default=1,
-                   help="Max trades per candle / 30-min interval. [1]")
-    p.add_argument("--max-daily-trades", type=int, default=100)
-    p.add_argument("--refit-every", type=int, default=1, metavar="DAYS",
-                   help="Model refit cadence. 1=daily. [1]")
-    p.add_argument("--fee-rate", type=float, default=0.02)
+    _mt = _cfg.mega_tune
+    p.add_argument("--n-rounds", type=int, default=_mt.n_rounds,
+                   help=f"Total BO rounds (each model gets one eval per round). [{_mt.n_rounds}]")
+    p.add_argument("--n-init", type=int, default=_mt.n_init,
+                   help=f"Random init rounds before GP-EI kicks in. [{_mt.n_init}]")
+    p.add_argument("--seed", type=int, default=_mt.seed)
+    p.add_argument("--start", default=_mt.start_date, metavar="YYYY-MM-DD",
+                   help=f"Backtest window start. [{_mt.start_date}]")
+    p.add_argument("--end",   default=_mt.end_date, metavar="YYYY-MM-DD",
+                   help=f"Backtest window end.   [{_mt.end_date}]")
+    p.add_argument("--max-bet-dollars", type=float, default=_mt.max_bet_dollars, metavar="$",
+                   help=f"Hard dollar cap per trade per session. [{_mt.max_bet_dollars}]")
+    p.add_argument("--max-session-trades", type=int, default=_mt.max_session_trades,
+                   help=f"Max trades per candle / interval. [{_mt.max_session_trades}]")
+    p.add_argument("--max-daily-trades", type=int, default=_mt.max_daily_trades)
+    p.add_argument("--refit-every", type=int, default=_mt.refit_every, metavar="DAYS",
+                   help=f"Model refit cadence. 1=daily. [{_mt.refit_every}]")
+    p.add_argument("--fee-rate", type=float, default=_mt.fee_rate)
+    p.add_argument("--pessimistic-pricing", action="store_true",
+                   help="Buy at candle high, sell at candle low (worst-case fill simulation).")
+    p.add_argument("--recency-halflife", type=int, default=None, metavar="DAYS",
+                   help="Exponential recency weighting: trades N days ago count half as much. "
+                        "None = flat. Try 90 to weight current season 4x over 6 months ago.")
     p.add_argument("--no-validate", action="store_true",
                    help="Skip data quality validation.")
 
@@ -443,8 +457,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 "Don't launch update_data.py — instead wait for "
                                 "an already-running instance to finish, then proceed."
                             ))
-    p.add_argument("--n-jobs", type=int, default=2,
-                   help="Parallel worker processes. [2]")
+    p.add_argument("--n-jobs", type=int, default=_cfg.mega_tune.n_jobs,
+                   help=f"Parallel worker processes. [{_cfg.mega_tune.n_jobs}]")
     p.add_argument("--list", action="store_true",
                    help="Print models + search spaces then exit.")
     p.add_argument("--resume", action="store_true",
@@ -484,6 +498,7 @@ def main() -> None:
     price_store = KalshiPriceStore().load()
     print(price_store.coverage_summary())
 
+    _mt = _cfg.mega_tune
     eval_cfg = EvalConfig(
         start_date=args.start,
         end_date=args.end,
@@ -493,6 +508,11 @@ def main() -> None:
         max_daily_trades=args.max_daily_trades,
         refit_every=args.refit_every,
         fee_rate=args.fee_rate,
+        cash_reserve_fraction=_mt.cash_reserve_fraction,
+        rotation_min_edge_gain=_mt.rotation_min_edge_gain,
+        initial_bankroll=_mt.initial_bankroll,
+        pessimistic_pricing=args.pessimistic_pricing,
+        recency_halflife_days=args.recency_halflife,
     )
 
     print("\nLoading feature data...")
@@ -509,30 +529,43 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    n_init = min(args.n_init, args.n_rounds)
+
+    # ── Step 3b: restore prior state if resuming ──────────────────────────────
+    start_round = 0
+    if args.resume:
+        # Find the most recent timestamped run directory
+        existing = sorted(OUT_ROOT.glob("20??????_??????"))
+        if existing:
+            run_dir = existing[-1]
+            progress_path = run_dir / "progress.json"
+            if progress_path.exists():
+                prog = json.load(open(progress_path))
+                start_round = int(prog.get("rounds_done", 0))
+                print(f"Resuming run {run_dir.name} from round "
+                      f"{start_round}/{args.n_rounds} "
+                      f"(read from {progress_path})")
+            else:
+                print(f"Found run dir {run_dir.name} but no progress.json — starting fresh.")
+                run_dir = OUT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            print("--resume specified but no prior run dirs found — starting fresh.")
+            run_dir = OUT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        run_dir = OUT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
+
     model_states = [
         ModelState(
             name=name,
             space=th.SEARCH_SPACES[name],
             n_rounds=args.n_rounds,
             rng=rng,
-            out_dir=OUT_ROOT / name,
+            out_dir=run_dir / name,
         )
         for name in models_to_run
     ]
 
-    n_init = min(args.n_init, args.n_rounds)
-
-    # ── Step 3b: restore prior state if resuming ──────────────────────────────
-    start_round = 0
     if args.resume:
-        progress_path = OUT_ROOT / "progress.json"
-        if progress_path.exists():
-            prog = json.load(open(progress_path))
-            start_round = int(prog.get("rounds_done", 0))
-            print(f"Resuming from round {start_round}/{args.n_rounds} "
-                  f"(read from {progress_path})")
-        else:
-            print("--resume specified but no progress.json found — starting fresh.")
         for state in model_states:
             state.load_state()
             if state.n_evals:
@@ -557,7 +590,10 @@ def main() -> None:
           f"{eval_cfg.max_daily_trades}/day")
     print(f"  Fee:           {eval_cfg.fee_rate:.0%}  |  "
           f"Timeout: {TIMEOUT_SECS}s  |  Workers: {args.n_jobs}")
-    print(f"  Output:        {OUT_ROOT}/")
+    print(f"  Cash reserve:  {eval_cfg.cash_reserve_fraction:.0%}  |  "
+          f"Rotation min edge gain: {eval_cfg.rotation_min_edge_gain:.0%}  |  "
+          f"Initial bankroll: ${eval_cfg.initial_bankroll:.2f}")
+    print(f"  Output:        {run_dir}/")
     print(f"{'='*70}\n")
 
     # ── Step 4: run ───────────────────────────────────────────────────────────
@@ -569,6 +605,7 @@ def main() -> None:
         n_rounds=args.n_rounds,
         n_init=n_init,
         rng=rng,
+        run_dir=run_dir,
         n_jobs=args.n_jobs,
         start_round=start_round,
     )

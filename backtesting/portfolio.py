@@ -38,6 +38,7 @@ class OpenPosition:
     entry_session: int
     entry_session_ts: int
     entry_date: str         # ISO date string
+    entry_available_cash: float = 0.0  # available_cash at the moment this entry was placed
 
 
 @dataclass
@@ -68,6 +69,7 @@ class Trade:
     # Fields added for exit tracking (have defaults for backward compatibility)
     trade_type: str = "settle"   # "settle" (held to expiry) | "exit" (early close)
     entry_mkt_p: float = 0.0     # YES close price when position was opened
+    available_cash: float = 0.0  # cash available at the moment the entry decision was made
 
 
 class Portfolio:
@@ -127,17 +129,34 @@ class Portfolio:
         # Keyed by ticker; removed on exit or settlement.
         self._open_positions: dict[str, "OpenPosition"] = {}
 
+        # Cumulative entry cost per ticker across the entire run.
+        # Updated when a position is opened (allow_exits=True) or when a trade
+        # is recorded as an entry (allow_exits=False).  Never decremented on exit
+        # or settlement — this is a lifetime spending tracker used to enforce the
+        # per-ticker dollar cap across multiple trading days.
+        self._ticker_cost: dict[str, float] = {}
+
+        # Intraday capital tracking.
+        # Contracts settle at end-of-day (midnight on Kalshi), not when placed.
+        # We track how much cash has been deployed today so that sizing uses the
+        # opening balance minus deployed — preventing intraday PnL recycling.
+        self._day_opening_bankroll: float = float(initial_bankroll)
+        self._day_deployed: float = 0.0
+
     # ── day / session state transitions ──────────────────────────────────────
 
     def begin_day(self, date: str) -> None:
         """
         Must be called once at the start of each new calendar day.
-        Resets daily and session counters.
+        Resets daily and session counters, and snapshots the opening bankroll
+        for intraday capital tracking.
         """
         self._current_day = date
         self._day_trade_count = 0
         self._current_session = -1
         self._session_trade_count = 0
+        self._day_opening_bankroll = self._bankroll
+        self._day_deployed = 0.0
 
     def begin_session(self, session: int) -> None:
         """
@@ -173,6 +192,8 @@ class Portfolio:
         The actual PnL is recorded later via record_trade() at exit or settlement.
         """
         self._open_positions[pos.ticker] = pos
+        self._ticker_cost[pos.ticker] = self._ticker_cost.get(pos.ticker, 0.0) + pos.size
+        self._day_deployed += pos.size
         self._day_trade_count += 1
         self._session_trade_count += 1
 
@@ -218,6 +239,10 @@ class Portfolio:
         """
         self._bankroll = max(self._bankroll + trade.pnl, 1.0)
         if count_toward_limits:
+            # allow_exits=False path: entry and settlement are one atomic event.
+            # Track spending so the per-ticker cap works across days.
+            self._ticker_cost[trade.ticker] = self._ticker_cost.get(trade.ticker, 0.0) + trade.size
+            self._day_deployed += trade.size
             self._day_trade_count += 1
             self._session_trade_count += 1
         self._trades.append(trade)
@@ -227,6 +252,24 @@ class Portfolio:
     @property
     def bankroll(self) -> float:
         return self._bankroll
+
+    @property
+    def available_cash(self) -> float:
+        """
+        Cash available for new entries today.
+
+        = opening_bankroll - deployed_so_far_today
+
+        Kalshi contracts settle at midnight, not when placed. This prevents
+        intraday PnL recycling: winnings from morning bets cannot fund
+        afternoon bets on the same day.
+        """
+        return max(0.0, self._day_opening_bankroll - self._day_deployed)
+
+    @property
+    def ticker_cost(self) -> dict[str, float]:
+        """Cumulative entry cost per ticker across the entire run."""
+        return self._ticker_cost
 
     @property
     def n_trades(self) -> int:

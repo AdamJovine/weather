@@ -42,6 +42,7 @@ from sklearn.ensemble import (
 from sklearn.isotonic import IsotonicRegression
 from scipy.stats import norm
 
+from src.app_config import cfg as _cfg
 from src.config import RIDGE_ALPHA, TEMP_GRID_MIN, TEMP_GRID_MAX
 
 FEATURES = [
@@ -63,7 +64,7 @@ FEATURES = [
     "nws_bias_14d",           # trailing 14-day mean signed NWS error (°F); positive = NWS running warm
 ]
 
-SPREAD_ALPHA = 0.3   # how much ensemble_spread widens the aleatoric sigma
+SPREAD_ALPHA = _cfg.model.spread_alpha  # how much ensemble_spread widens the aleatoric sigma
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ class _BaseTempModel:
 
     sigma_: float = None   # residual std on training data
     is_fit: bool = False
+    _sigma_floor: float = 4.0  # minimum predictive sigma — prevents overconfidence on tail events
 
     def fit(self, df: pd.DataFrame) -> "_BaseTempModel":
         raise NotImplementedError
@@ -134,7 +136,7 @@ class _BaseTempModel:
 
         rows = []
         for i, (m, s) in enumerate(zip(mu, total_sigma)):
-            s = max(s, 1.0)
+            s = max(s, self._sigma_floor)
             probs = [
                 norm.cdf(k + 0.5, loc=m, scale=s) - norm.cdf(k - 0.5, loc=m, scale=s)
                 for k in temp_grid
@@ -175,6 +177,37 @@ class _BaseTempModel:
 
         return X, y, sw
 
+    def _fit_and_oos_sigma(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sw,
+        fit_fn,
+        val_frac: float = 0.2,
+        min_val: int = 30,
+        min_train: int = 50,
+    ) -> float:
+        """
+        Estimate out-of-sample sigma via a single time-series train/val split:
+          1. Fit on the first (1 - val_frac) rows.
+          2. Measure residuals on the held-out tail.
+          3. Refit on all rows so the deployed model uses full history.
+        Falls back to in-sample sigma when the dataset is too small to split.
+        fit_fn signature: (X, y, sw) -> None  (fits model in place)
+        """
+        n = len(y)
+        n_val = max(min_val, int(n * val_frac))
+        n_train = n - n_val
+        if n_train < min_train:
+            fit_fn(X, y, sw)
+            return max(float((y - self._predict_mu(X)).std(ddof=1)), 1.0)
+        sw_tr = sw[:n_train] if sw is not None else None
+        fit_fn(X[:n_train], y[:n_train], sw_tr)
+        oos_resid = y[n_train:] - self._predict_mu(X[n_train:])
+        oos_sigma = float(oos_resid.std(ddof=1))
+        fit_fn(X, y, sw)
+        return max(oos_sigma, 1.0)
+
 
 # ---------------------------------------------------------------------------
 # 1. Bayesian Ridge  (analytic posterior → epistemic from weight uncertainty)
@@ -187,9 +220,10 @@ class BayesianTempModel(_BaseTempModel):
         self._model = BayesianRidge()
 
     def fit(self, df: pd.DataFrame) -> "BayesianTempModel":
-        X, y, _sw = self._fit_core(df)   # BayesianRidge has no sample_weight support
-        self._model.fit(X, y)
-        self.sigma_ = float((y - self._model.predict(X)).std(ddof=1))
+        X, y, _ = self._fit_core(df)
+        self.sigma_ = self._fit_and_oos_sigma(
+            X, y, None, lambda Xt, yt, _w: self._model.fit(Xt, yt),
+        )
         self.is_fit = True
         return self
 
@@ -222,9 +256,10 @@ class ARDTempModel(_BaseTempModel):
         self._model = ARDRegression()
 
     def fit(self, df: pd.DataFrame) -> "ARDTempModel":
-        X, y, _sw = self._fit_core(df)   # ARDRegression has no sample_weight support
-        self._model.fit(X, y)
-        self.sigma_ = float((y - self._model.predict(X)).std(ddof=1))
+        X, y, _ = self._fit_core(df)
+        self.sigma_ = self._fit_and_oos_sigma(
+            X, y, None, lambda Xt, yt, _w: self._model.fit(Xt, yt),
+        )
         self.is_fit = True
         return self
 
@@ -261,11 +296,12 @@ class InteractionBayesModel(_BaseTempModel):
         self._model = BayesianRidge()
 
     def fit(self, df: pd.DataFrame) -> "InteractionBayesModel":
-        X, y, _sw = self._fit_core(df)   # BayesianRidge has no sample_weight support
-        Xp = self._poly.fit_transform(X)
-        Xs = self._scaler.fit_transform(Xp)
-        self._model.fit(Xs, y)
-        self.sigma_ = float((y - self._model.predict(Xs)).std(ddof=1))
+        X, y, _ = self._fit_core(df)
+        def _fn(Xt, yt, _w):
+            Xp = self._poly.fit_transform(Xt)
+            Xs = self._scaler.fit_transform(Xp)
+            self._model.fit(Xs, yt)
+        self.sigma_ = self._fit_and_oos_sigma(X, y, None, _fn)
         self.is_fit = True
         return self
 
@@ -306,21 +342,21 @@ class KernelRidgeModel(_BaseTempModel):
         self._models: list = []
 
     def fit(self, df: pd.DataFrame) -> "KernelRidgeModel":
-        X, y, _sw = self._fit_core(df)   # KernelRidge has no sample_weight support
-        Xs = self._scaler.fit_transform(X)
-        n = len(y)
-        rng = np.random.default_rng(42)
-        self._models = []
-        for _ in range(self.N_BOOT):
-            idx = rng.integers(0, n, size=n)
-            m = KernelRidge(kernel="rbf", alpha=self._alpha, gamma=self._gamma)
-            m.fit(Xs[idx], y[idx])
-            self._models.append(m)
-        # sigma_ from full-data residuals using the first model
-        m0 = KernelRidge(kernel="rbf", alpha=self._alpha, gamma=self._gamma)
-        m0.fit(Xs, y)
-        self.sigma_ = float((y - m0.predict(Xs)).std(ddof=1))
-        self._base_model = m0
+        X, y, _ = self._fit_core(df)
+        def _fn(Xt, yt, _w):
+            Xs = self._scaler.fit_transform(Xt)
+            n = len(yt)
+            rng = np.random.default_rng(42)
+            self._models = []
+            for _ in range(self.N_BOOT):
+                idx = rng.integers(0, n, size=n)
+                m = KernelRidge(kernel="rbf", alpha=self._alpha, gamma=self._gamma)
+                m.fit(Xs[idx], yt[idx])
+                self._models.append(m)
+            m0 = KernelRidge(kernel="rbf", alpha=self._alpha, gamma=self._gamma)
+            m0.fit(Xs, yt)
+            self._base_model = m0
+        self.sigma_ = self._fit_and_oos_sigma(X, y, None, _fn)
         self.is_fit = True
         return self
 
@@ -417,8 +453,9 @@ class RandomForestModel(_BaseTempModel):
 
     def fit(self, df: pd.DataFrame) -> "RandomForestModel":
         X, y, sw = self._fit_core(df)
-        self._model.fit(X, y, sample_weight=sw)
-        self.sigma_ = float((y - self._model.predict(X)).std(ddof=1))
+        self.sigma_ = self._fit_and_oos_sigma(
+            X, y, sw, lambda Xt, yt, wt: self._model.fit(Xt, yt, sample_weight=wt),
+        )
         self.is_fit = True
         return self
 
@@ -447,8 +484,9 @@ class ExtraTreesModel(_BaseTempModel):
 
     def fit(self, df: pd.DataFrame) -> "ExtraTreesModel":
         X, y, sw = self._fit_core(df)
-        self._model.fit(X, y, sample_weight=sw)
-        self.sigma_ = float((y - self._model.predict(X)).std(ddof=1))
+        self.sigma_ = self._fit_and_oos_sigma(
+            X, y, sw, lambda Xt, yt, wt: self._model.fit(Xt, yt, sample_weight=wt),
+        )
         self.is_fit = True
         return self
 
@@ -478,10 +516,11 @@ class QuantileGBModel(_BaseTempModel):
 
     def fit(self, df: pd.DataFrame) -> "QuantileGBModel":
         X, y, sw = self._fit_core(df)
-        self._m_mu.fit(X, y, sample_weight=sw)
-        self._m_lo.fit(X, y, sample_weight=sw)
-        self._m_hi.fit(X, y, sample_weight=sw)
-        self.sigma_ = float((y - self._m_mu.predict(X)).std(ddof=1))
+        def _fn(Xt, yt, wt):
+            self._m_mu.fit(Xt, yt, sample_weight=wt)
+            self._m_lo.fit(Xt, yt, sample_weight=wt)
+            self._m_hi.fit(Xt, yt, sample_weight=wt)
+        self.sigma_ = self._fit_and_oos_sigma(X, y, sw, _fn)
         self.is_fit = True
         return self
 
@@ -511,8 +550,9 @@ class BaggingRidgeModel(_BaseTempModel):
 
     def fit(self, df: pd.DataFrame) -> "BaggingRidgeModel":
         X, y, sw = self._fit_core(df)
-        self._model.fit(X, y, sample_weight=sw)
-        self.sigma_ = float((y - self._model.predict(X)).std(ddof=1))
+        self.sigma_ = self._fit_and_oos_sigma(
+            X, y, sw, lambda Xt, yt, wt: self._model.fit(Xt, yt, sample_weight=wt),
+        )
         self.is_fit = True
         return self
 

@@ -165,9 +165,10 @@ class BacktestEngine:
                     portfolio.begin_session(s_idx)
 
                     if cfg.allow_exits:
-                        markets = _session_to_markets(session, city, cfg.half_spread)
+                        markets = _session_to_markets(session, city, cfg.half_spread, cfg.pessimistic_pricing)
                         bt_positions = _backtest_positions(portfolio, city)
-                        intents = pm.evaluate(markets, {city: prob_row}, bt_positions, portfolio.bankroll)
+                        intents = pm.evaluate(markets, {city: prob_row}, bt_positions, portfolio.available_cash,
+                                              ticker_cost=portfolio.ticker_cost)
 
                         for intent in intents:
                             if intent.action == "sell":
@@ -185,6 +186,7 @@ class BacktestEngine:
                             elif intent.action == "buy":
                                 if not portfolio.can_trade():
                                     break
+                                cash_at_entry = portfolio.available_cash
                                 portfolio.open_position(OpenPosition(
                                     city=city,
                                     ticker=intent.ticker,
@@ -200,23 +202,27 @@ class BacktestEngine:
                                     entry_session=s_idx,
                                     entry_session_ts=session.ts,
                                     entry_date=trade_date_str,
+                                    entry_available_cash=cash_at_entry,
                                 ))
                     else:
                         if not portfolio.can_trade():
                             break
-                        markets = _session_to_markets(session, city, cfg.half_spread)
-                        intents = pm.evaluate(markets, {city: prob_row}, {}, portfolio.bankroll)
+                        markets = _session_to_markets(session, city, cfg.half_spread, cfg.pessimistic_pricing)
+                        intents = pm.evaluate(markets, {city: prob_row}, {}, portfolio.available_cash,
+                                              ticker_cost=portfolio.ticker_cost)
                         for intent in intents:
                             if intent.action != "buy":
                                 continue
                             if not portfolio.can_trade():
                                 break
+                            cash_at_entry = portfolio.available_cash
                             trade = _build_trade_from_intent(
                                 run_id=run_id, city=city, session=s_idx,
                                 session_ts=session.ts, trade_date_str=trade_date_str,
                                 test_row=test_row,
                                 intent=intent, portfolio=portfolio,
                                 fee_rate=cfg.fee_rate,
+                                available_cash=cash_at_entry,
                             )
                             if trade is not None:
                                 portfolio.record_trade(trade)
@@ -233,8 +239,7 @@ class BacktestEngine:
                             portfolio=portfolio,
                             fee_rate=cfg.fee_rate,
                         )
-                        if settle is not None:
-                            portfolio.record_trade(settle, count_toward_limits=False)
+                        portfolio.record_trade(settle, count_toward_limits=False)
 
         return RunResult(
             run_id=run_id,
@@ -370,24 +375,47 @@ class BacktestEngine:
         return model
 
 
-def _session_to_markets(session: Session, city: str, half_spread: float = 0.0) -> list[dict]:
+def _session_to_markets(
+    session: Session,
+    city: str,
+    half_spread: float = 0.0,
+    pessimistic: bool = False,
+) -> list[dict]:
     """Convert a backtest Session to PortfolioManager-compatible market dicts.
 
     half_spread adds a simulated bid-ask spread so yes_ask + no_ask > 1.0,
-    matching real Kalshi execution costs.  With half_spread=0.01 the total
-    round-trip spread is ~2 cents, consistent with liquid temperature markets.
+    matching real Kalshi execution costs.  With half_spread=0.02 the total
+    round-trip spread is ~4 cents (actual observed median in contested markets
+    is 6-12 cents round-trip; 4 cents is a conservative baseline).
+
+    When pessimistic=True, uses the candle's intra-period high/low instead of
+    the close, giving worst-case fills within the hourly window:
+      YES buys → yes_ask = high_dollars  (paid highest YES during candle)
+      NO  buys → no_ask  = 1 - low_dollars (lowest NO price = highest YES)
+    half_spread is NOT added in pessimistic mode — high/low already represent
+    the worst observed fill, adding spread on top would double-count.
+    Falls back to close + half_spread when high/low are unavailable.
     """
-    return [
-        {
+    markets = []
+    for pc in session.contracts:
+        if pessimistic and pc.high_dollars is not None and pc.low_dollars is not None:
+            # Use actual intra-candle extremes as the fill price — no extra spread
+            yes_ask = pc.high_dollars
+            no_ask  = 1.0 - pc.low_dollars
+            spread_to_add = 0.0
+        else:
+            yes_ask = pc.close_dollars
+            no_ask  = 1.0 - pc.close_dollars
+            spread_to_add = half_spread
+        markets.append({
             "ticker": pc.ticker,
             "title": pc.title,
             "_city": city,
-            "yes_ask_dollars": min(0.99, round(pc.close_dollars + half_spread, 6)),
-            "no_ask_dollars": min(0.99, round(1.0 - pc.close_dollars + half_spread, 6)),
+            "yes_ask_dollars": min(0.99, round(yes_ask + spread_to_add, 6)),
+            "no_ask_dollars":  min(0.99, round(no_ask  + spread_to_add, 6)),
             "volume": pc.volume,
-        }
-        for pc in session.contracts
-    ]
+        })
+    return markets
 
 
 def _backtest_positions(portfolio: Portfolio, city: str) -> dict[str, float]:
@@ -416,6 +444,7 @@ def _build_trade_from_intent(
     intent: "OrderIntent",
     portfolio: Portfolio,
     fee_rate: float = 0.02,
+    available_cash: float = 0.0,
 ) -> Optional[Trade]:
     """
     Settle a PortfolioManager buy intent against the observed y_tmax.
@@ -465,6 +494,7 @@ def _build_trade_from_intent(
         pnl=pnl,
         outcome=outcome,
         bankroll_after=portfolio.bankroll + pnl,
+        available_cash=available_cash,
     )
 
 
@@ -512,6 +542,7 @@ def _build_exit_trade(
         bankroll_after=portfolio.bankroll + pnl,
         trade_type="exit",
         entry_mkt_p=pos.entry_mkt_p,
+        available_cash=pos.entry_available_cash,
     )
 
 
@@ -522,12 +553,15 @@ def _build_settlement_trade(
     pos: "OpenPosition",
     portfolio: Portfolio,
     fee_rate: float,
-) -> Optional[Trade]:
+) -> Trade:
     """
     Settle an open position using the observed y_tmax (end-of-day outcome).
 
     This mirrors the PnL logic in _build_trade_from_intent but operates on a
     stored OpenPosition rather than an OrderIntent.
+
+    Raises ValueError for unknown contract_type — callers must not swallow this,
+    as the position has already been removed from the portfolio before this is called.
     """
     y_tmax = float(test_row["y_tmax"])
     cd = pos.contract_def
@@ -539,7 +573,12 @@ def _build_settlement_trade(
     elif pos.contract_type == "range":
         outcome_yes = int(cd["low"] <= y_tmax <= cd["high"])
     else:
-        return None
+        raise ValueError(
+            f"_build_settlement_trade: unknown contract_type {pos.contract_type!r} "
+            f"for ticker {pos.ticker!r} (city={city}, entry_date={pos.entry_date}). "
+            f"Position was already closed; bankroll would be corrupted by silently "
+            f"skipping settlement. Fix the contract_type stored on this position."
+        )
 
     outcome = outcome_yes if pos.side == "yes" else (1 - outcome_yes)
     mkt_p = pos.entry_mkt_p
@@ -573,6 +612,7 @@ def _build_settlement_trade(
         bankroll_after=portfolio.bankroll + pnl,
         trade_type="settle",
         entry_mkt_p=mkt_p,
+        available_cash=pos.entry_available_cash,
     )
 
 

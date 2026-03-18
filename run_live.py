@@ -21,6 +21,7 @@ IMPORTANT: Always run scripts/update_data.py before this script to ensure
 
 import json
 import math
+import pickle
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ import pandas as pd
 sys.path.insert(0, str(Path("scripts")))
 import tune_hyperparams as _th
 
+from src.app_config import cfg as _cfg
 from src.config import KALSHI_BASE_URL
 from src.features import build_feature_table
 import src.model as _model_module
@@ -52,12 +54,14 @@ from src.config import TEMP_GRID_MIN, TEMP_GRID_MAX
 # Config
 # ------------------------------------------------------------------
 
-BANKROLL = 5.0
+BANKROLL               = _cfg.live.bankroll
+CASH_RESERVE_FRACTION  = _cfg.live.cash_reserve_fraction
+ROTATION_MIN_EDGE_GAIN = _cfg.live.rotation_min_edge_gain
+MAX_BET_DOLLARS        = _cfg.live.max_bet_dollars
 
-OUT_ROOT = Path("logs/mega_tune")
-
-STATIONS_FILE = Path("data/stations.csv")
-KALSHI_RATE_SLEEP = 0.5   # seconds between Kalshi API calls
+OUT_ROOT      = Path(_cfg.paths.tune_output)
+STATIONS_FILE = Path(_cfg.paths.stations)
+KALSHI_RATE_SLEEP = _cfg.live.kalshi_rate_sleep
 
 
 # ------------------------------------------------------------------
@@ -165,11 +169,11 @@ def fetch_weather_markets(auth, stations: pd.DataFrame, target_date: str) -> lis
 # Main
 # ------------------------------------------------------------------
 
-def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
+def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json: str | None = None):
     from datetime import datetime as _dt
 
     # Reload best params on every cycle so mega_tune improvements are picked up live
-    best_path = OUT_ROOT / model_name / "best.json"
+    best_path = Path(best_json) if best_json else OUT_ROOT / model_name / "best.json"
     if not best_path.exists():
         print(f"ERROR: no best.json for model '{model_name}' at {best_path}")
         sys.exit(1)
@@ -179,7 +183,7 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     _now = _dt.now()
     # Before 4 pm local time, today's markets are still open — trade same-day.
     # After 4 pm, target tomorrow.
-    if _now.hour < 16:
+    if _now.hour < _cfg.live.target_date_cutoff_hour:
         TARGET_DATE = date.today().isoformat()
     else:
         TARGET_DATE = (date.today() + timedelta(days=1)).isoformat()
@@ -282,10 +286,16 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
         except Exception as e:
             print(f"  {city}: model fit failed — {e}")
 
-    # Calibrator disabled: was trained only on P(tmax>=72) events and distorts
-    # the full temperature distribution when applied across all bins.
-    calibrator = None
-    print("Using raw model probabilities (calibrator disabled).")
+    # Load pre-fitted probability calibrator if available.
+    # Generate with: python scripts/fit_calibrator.py
+    _cal_path = Path("logs/calibrator.pkl")
+    if _cal_path.exists():
+        with open(_cal_path, "rb") as _f:
+            calibrator = pickle.load(_f)
+        print(f"Loaded probability calibrator from {_cal_path}")
+    else:
+        calibrator = None
+        print("No calibrator found — using raw model probabilities. Run scripts/fit_calibrator.py to generate one.")
 
     # 4. Build probability rows for target date
     print(f"\nBuilding predictions for {TARGET_DATE}...")
@@ -308,18 +318,17 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
         # The calibrator corrects systematic bias in the raw model probabilities.
         if calibrator is not None:
             import numpy as np
-            from src.config import TEMP_GRID_MIN, TEMP_GRID_MAX
             temp_keys = [f"temp_{k}" for k in range(TEMP_GRID_MIN, TEMP_GRID_MAX + 1)]
             raw_probs = prob_row[temp_keys].values.astype(float)
-            # Compute raw cumulative (geq) probability at each bin boundary,
-            # calibrate it, then back-derive bin probabilities.
-            cumsum = np.cumsum(raw_probs[::-1])[::-1]  # P(tmax >= k) for each k
+            # P(tmax >= k) for each k in the grid — decreasing array
+            cumsum = np.cumsum(raw_probs[::-1])[::-1]
             cal_cumsum = calibrator.predict(cumsum)
             cal_cumsum = np.clip(cal_cumsum, 0, 1)
-            # Reconstruct bin probabilities from calibrated cumulative
-            cal_bins = np.diff(np.concatenate([cal_cumsum, [0.0]]), prepend=0.0)
-            cal_bins = np.abs(cal_bins)
-            cal_bins /= cal_bins.sum()  # renormalize
+            # P(tmax == k) = P(tmax >= k) - P(tmax >= k+1)
+            cal_bins = cal_cumsum - np.concatenate([cal_cumsum[1:], [0.0]])
+            cal_bins = np.maximum(cal_bins, 0.0)
+            if cal_bins.sum() > 0:
+                cal_bins /= cal_bins.sum()
             for key, val in zip(temp_keys, cal_bins):
                 prob_row[key] = val
 
@@ -374,6 +383,21 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
         pred_mean = float(mu_arr[0])
         probs_df = model.predict_integer_probs(city_df)
         prob_row = probs_df.iloc[0]
+
+        if calibrator is not None:
+            import numpy as np
+            temp_keys = [f"temp_{k}" for k in range(TEMP_GRID_MIN, TEMP_GRID_MAX + 1)]
+            raw_probs = prob_row[temp_keys].values.astype(float)
+            cumsum = np.cumsum(raw_probs[::-1])[::-1]
+            cal_cumsum = calibrator.predict(cumsum)
+            cal_cumsum = np.clip(cal_cumsum, 0, 1)
+            cal_bins = cal_cumsum - np.concatenate([cal_cumsum[1:], [0.0]])
+            cal_bins = np.maximum(cal_bins, 0.0)
+            if cal_bins.sum() > 0:
+                cal_bins /= cal_bins.sum()
+            for key, val in zip(temp_keys, cal_bins):
+                prob_row[key] = val
+
         pred_rows_tmrw[city] = prob_row
 
         fcast_high = city_df.iloc[0].get("forecast_high")
@@ -425,8 +449,11 @@ def main(dry_run: bool = True, model_name: str = "BaggingRidge"):
     pm = PortfolioManager(
         kelly_fraction=float(_BEST["kelly_fraction"]),
         max_bet_fraction=float(_BEST["max_bet_frac"]),
+        max_bet_dollars=MAX_BET_DOLLARS,
         min_edge=float(_BEST["min_edge"]),
         min_confidence=float(_BEST["min_confidence"]),
+        cash_reserve_fraction=CASH_RESERVE_FRACTION,
+        rotation_min_edge_gain=ROTATION_MIN_EDGE_GAIN,
     )
     city_multipliers = {
         city: city_ucb.kelly_multiplier(city)
@@ -599,13 +626,17 @@ if __name__ == "__main__":
         "--model", type=str, default="BaggingRidge", metavar="MODEL",
         help="Model name matching a subdirectory in logs/mega_tune/ (default: BaggingRidge)",
     )
+    parser.add_argument(
+        "--best-json", type=str, default=None, metavar="PATH",
+        help="Direct path to a best.json file (overrides --model path lookup)",
+    )
     args = parser.parse_args()
 
     if args.interval > 0:
         print(f"Loop mode: refreshing every {args.interval} minutes. Ctrl+C to stop.\n")
         while True:
-            main(dry_run=not args.live, model_name=args.model)
+            main(dry_run=not args.live, model_name=args.model, best_json=args.best_json)
             print(f"\nNext run in {args.interval}m — waiting for next model update...\n")
             time.sleep(args.interval * 60)
     else:
-        main(dry_run=not args.live, model_name=args.model)
+        main(dry_run=not args.live, model_name=args.model, best_json=args.best_json)

@@ -17,8 +17,9 @@ import pandas as pd
 warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
 warnings.filterwarnings("ignore", "Downcasting object dtype arrays", FutureWarning)
 
+from src.app_config import cfg as _cfg
 
-_EPOCH = pd.Timestamp("2018-01-01")
+_EPOCH = pd.Timestamp(_cfg.model.feature_epoch)
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -34,12 +35,24 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-_MAX_LAG_GAP_DAYS = 7   # gaps larger than this mean lags are from a stale regime
+_MAX_LAG_GAP_DAYS = _cfg.model.max_lag_gap_days  # gaps larger than this mean lags are from a stale regime
 
 
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["city", "date"]).copy()
     df["date"] = pd.to_datetime(df["date"])
+
+    # Guard: duplicate (city, date) rows corrupt every downstream lag.
+    # diff() gives 0 for a duplicate pair (looks fresh, not stale), and
+    # rolling windows double-count the repeated row — both produce silently
+    # wrong lag values.  Raise early so the caller must fix the data.
+    _dups = df.duplicated(subset=["city", "date"], keep=False)
+    if _dups.any():
+        _bad = df.loc[_dups, ["city", "date"]].drop_duplicates().to_string(index=False)
+        raise ValueError(
+            f"add_lag_features: {_dups.sum()} duplicate (city, date) rows detected — "
+            f"lag features would be silently wrong. Fix upstream data.\n{_bad}"
+        )
 
     # Days since the previous row (within city) — used to detect stale lags
     df["_date_gap"] = df.groupby("city")["date"].diff().dt.days
@@ -232,12 +245,27 @@ def build_feature_table(
 
     df = df.sort_values(["city", "date"]).reset_index(drop=True)
 
-    # ── Issue 2 fix: day-ahead forecast alignment ──────────────────
+    # ── Day-ahead forecast alignment ───────────────────────────────
     # OpenMeteo's historical forecast API returns the same-day model run
     # (00Z–18Z on date D), which incorporates observations from D itself
     # and is far more accurate than what a trader has at market open.
     # Shifting by 1 day ensures every forecast feature reflects what was
     # available the *previous* day — a genuine day-ahead signal.
+    #
+    # NWS live forecasts (fcast) are already for the target date and must
+    # NOT be shifted. Capture them before shifting, then restore via
+    # index-aligned update so alignment is guaranteed.
+    _nws_restore_cols = [c for c in ("forecast_high", "nbm_high") if c in fcast_cols and c in df.columns]
+    if _nws_restore_cols:
+        _nws = (
+            fcast[["city", "date"] + _nws_restore_cols]
+            .copy()
+            .dropna(subset=_nws_restore_cols, how="all")
+            .set_index(["city", "date"])
+        )
+    else:
+        _nws = None
+
     _gfs_cols = [c for c in ("forecast_high", "ensemble_spread",
                               "forecast_high_ecmwf", "ecmwf_minus_gfs",
                               "precip_forecast", "temp_850hpa",
@@ -245,19 +273,17 @@ def build_feature_table(
     for col in _gfs_cols:
         df[col] = df.groupby("city")[col].shift(1)
 
-    # Re-apply NWS live forecasts after the shift.
-    # The shift above is correct for GFS historical data (look-ahead prevention),
-    # but NWS forecasts in forecast_df are already for the target date and must
-    # not be displaced. Restore them here.
-    _fcast_restore = fcast[fcast_cols].copy()
-    _fcast_restore["date"] = pd.to_datetime(_fcast_restore["date"])
-    for _, frow in _fcast_restore.iterrows():
-        if pd.notna(frow.get("forecast_high")):
-            mask = (df["city"] == frow["city"]) & (df["date"] == frow["date"])
-            df.loc[mask, "forecast_high"] = frow["forecast_high"]
-        if "nbm_high" in frow and pd.notna(frow.get("nbm_high")) and "nbm_high" in df.columns:
-            mask = (df["city"] == frow["city"]) & (df["date"] == frow["date"])
-            df.loc[mask, "nbm_high"] = frow["nbm_high"]
+    # Restore NWS live forecasts using vectorized index alignment.
+    # set_index on (city, date) guarantees exact row matching with no
+    # iteration; pandas aligns on the index and only overwrites where
+    # _nws has a non-NaN value.
+    if _nws is not None and not _nws.empty:
+        df = df.set_index(["city", "date"])
+        for col in _nws_restore_cols:
+            if col in _nws.columns:
+                valid = _nws[col].dropna()
+                df.loc[valid.index, col] = valid
+        df = df.reset_index()
 
     df = add_time_features(df)
     df = add_lag_features(df)
@@ -301,10 +327,11 @@ def build_feature_table(
             df[col] = 0.0
 
     # NBM gridded max temperature.
-    # Available from forecast_df (live mode); impute historical with forecast_high.
+    # Available from forecast_df (live mode); impute historical with forecast_high,
+    # then fall back to climo_mean_doy (already computed above) for pre-GFS dates.
     if "nbm_high" not in df.columns:
         df["nbm_high"] = np.nan
-    df["nbm_high"] = df["nbm_high"].fillna(df["forecast_high"])
+    df["nbm_high"] = df["nbm_high"].fillna(df["forecast_high"]).fillna(df["climo_mean_doy"])
 
     # ECMWF signed disagreement: positive = ECMWF warmer than GFS.
     # Impute with 0 (no disagreement) where ECMWF data is unavailable.

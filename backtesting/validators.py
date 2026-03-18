@@ -41,6 +41,9 @@ from typing import List, Optional
 
 import pandas as pd
 
+from src.app_config import cfg as _cfg
+
+_v = _cfg.validation
 
 # ── issue / report dataclasses ────────────────────────────────────────────────
 
@@ -103,11 +106,11 @@ class ValidationReport:
 class DataValidator:
     """Validates all data sources before a backtest begins."""
 
-    TMAX_MIN: float = -60.0
-    TMAX_MAX: float = 140.0
-    MAX_GAP_DAYS: int = 14
-    MAX_NAN_RATE: float = 0.30     # warn if any feature column exceeds this
-    MAX_OBS_NAN_RATE: float = 0.05  # stricter threshold for observed tmax
+    TMAX_MIN: float = _v.tmax_min
+    TMAX_MAX: float = _v.tmax_max
+    MAX_GAP_DAYS: int = _v.max_gap_days
+    MAX_NAN_RATE: float = _v.max_nan_rate        # warn if any feature column exceeds this
+    MAX_OBS_NAN_RATE: float = _v.max_obs_nan_rate  # stricter threshold for observed tmax
 
     def validate_all(
         self,

@@ -48,11 +48,15 @@ from backtesting.data_loader import DataLoader
 from backtesting.engine import BacktestEngine
 from backtesting.market_data import KalshiPriceStore
 from backtesting.results import RunResult
+from src.app_config import cfg as _cfg
 
 warnings.filterwarnings("ignore")
 
 
 # ── Tuning-run settings (fixed across all trials) ────────────────────────────
+
+_tc = _cfg.tuning
+
 
 @dataclass
 class TuneConfig:
@@ -63,15 +67,20 @@ class TuneConfig:
       faster  → refit_every=14, sessions_per_day=1
       slower  → refit_every=1,  sessions_per_day=0 (all candles)
     """
-    start_date: str = "2022-01-01"
-    end_date: str = "2024-12-31"
-    refit_every: int = 14       # model refit cadence in calendar days
-    sessions_per_day: int = 1   # 1 = first candle per day; 0 = all candles
-    max_daily_trades: int = 4
-    max_session_trades: int = 4
-    min_train_rows: int = 365
+    start_date: str = _tc.start_date
+    end_date: str = _tc.end_date
+    refit_every: int = _tc.refit_every      # model refit cadence in calendar days
+    sessions_per_day: int = _tc.sessions_per_day  # 1 = first candle per day; 0 = all candles
+    max_daily_trades: int = _tc.max_daily_trades
+    max_session_trades: int = _tc.max_session_trades
+    min_train_rows: int = _tc.min_train_rows
     max_bet_dollars: Optional[float] = None  # hard dollar cap per trade (None = no cap)
-    fee_rate: float = 0.02                   # Kalshi fee fraction on winnings
+    fee_rate: float = _tc.fee_rate           # Kalshi fee fraction on winnings
+    cash_reserve_fraction: float = _tc.cash_reserve_fraction
+    rotation_min_edge_gain: float = _tc.rotation_min_edge_gain
+    initial_bankroll: float = _tc.initial_bankroll
+    pessimistic_pricing: bool = False
+    recency_halflife_days: Optional[int] = None  # None = flat weighting; N = trades N days ago count half as much
 
 
 # ── Hyperparameter search spaces ──────────────────────────────────────────────
@@ -95,6 +104,7 @@ _SHARED_PARAMS = [
     # Probability band — skip near-certain outcomes
     ("min_fair_p",      "linear", 0.02,  0.20),
     ("max_fair_p",      "linear", 0.80,  0.98),
+    ("sigma_floor",     "linear", 2.0,   7.0),   # minimum predictive sigma — prevents overconfidence on tail events
 ]
 
 SEARCH_SPACES = {
@@ -304,6 +314,7 @@ def make_model(model_name: str, params: dict):
     else:
         raise ValueError(f"Unknown model: {model_name!r}")
 
+    m._sigma_floor = float(params.get("sigma_floor", 4.0))
     return m
 
 
@@ -350,6 +361,10 @@ def evaluate_params(
             refit_every=tune_cfg.refit_every,
             min_train_rows=tune_cfg.min_train_rows,
             verbose=False,
+            cash_reserve_fraction=tune_cfg.cash_reserve_fraction,
+            rotation_min_edge_gain=tune_cfg.rotation_min_edge_gain,
+            initial_bankroll=tune_cfg.initial_bankroll,
+            pessimistic_pricing=tune_cfg.pessimistic_pricing,
         )
         # Capture params in a local so the lambda closure is stable
         _params = dict(params)
@@ -368,9 +383,20 @@ def evaluate_params(
 
     run = results.runs[0]
     year_pnls = _year_pnls(run.trades)
+
+    if tune_cfg.recency_halflife_days is not None and not run.trades.empty:
+        trades = run.trades.copy()
+        ref_date = pd.to_datetime(trades["date"]).max()
+        days_ago = (ref_date - pd.to_datetime(trades["date"])).dt.days.values
+        decay = np.log(2) / tune_cfg.recency_halflife_days
+        weights = np.exp(-decay * days_ago)
+        score = float((trades["pnl"].values * weights).sum())
+    else:
+        score = run.total_pnl
+
     if return_run:
-        return run.total_pnl, year_pnls, run
-    return run.total_pnl, year_pnls
+        return score, year_pnls, run
+    return score, year_pnls
 
 
 def _year_pnls(trades: pd.DataFrame) -> dict:
@@ -502,14 +528,17 @@ def main() -> None:
     parser.add_argument("--xi",      type=float, default=0.01,
                         help="EI exploration bonus")
     parser.add_argument("--seed",    type=int,   default=0)
-    parser.add_argument("--start",   default="2022-01-01",
+    parser.add_argument("--start",   default=_tc.start_date,
                         help="Backtest start date for tuning trials")
-    parser.add_argument("--end",     default="2024-12-31",
+    parser.add_argument("--end",     default=_tc.end_date,
                         help="Backtest end date for tuning trials")
-    parser.add_argument("--refit-every", type=int, default=14,
+    parser.add_argument("--refit-every", type=int, default=_tc.refit_every,
                         help="Model refit cadence in days (larger = faster trials)")
-    parser.add_argument("--sessions-per-day", type=int, default=1,
+    parser.add_argument("--sessions-per-day", type=int, default=_tc.sessions_per_day,
                         help="Price candles per day (1=fast, 0=all)")
+    parser.add_argument("--recency-halflife", type=int, default=None, metavar="DAYS",
+                        help="Exponential recency weighting: trades N days ago count half as much. "
+                             "None = flat. Try 90 to weight current season 4x over 6 months ago.")
     parser.add_argument("--no-validate", action="store_true",
                         help="Skip data quality validation")
     parser.add_argument("--list",    action="store_true",
@@ -535,6 +564,7 @@ def main() -> None:
         end_date=args.end,
         refit_every=args.refit_every,
         sessions_per_day=args.sessions_per_day,
+        recency_halflife_days=args.recency_halflife,
     )
 
     # ── Load data once — shared across all trials and all models ──────────────

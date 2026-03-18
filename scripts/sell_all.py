@@ -89,7 +89,7 @@ def main(dry_run: bool = True):
             f"    side={side}  contracts={count}"
             f"  bid=${bid:.2f}  value≈${count * bid:.2f}"
         )
-        orders.append((ticker, side, count, bid_cents))
+        orders.append((ticker, side, int(count), bid_cents))
 
     if not orders:
         print("\nNo positions to close.")

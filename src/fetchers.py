@@ -637,7 +637,7 @@ def fetch_settled_markets_pre(client, series: str) -> list[dict]:
 
 
 def _parse_candles(resp, is_pre: bool) -> list[dict]:
-    """Parse a candlestick response into [{ts, close_dollars, volume}]."""
+    """Parse a candlestick response into [{ts, close_dollars, high_dollars, low_dollars, volume}]."""
     rows = []
     for c in (_get_attr(resp, "candlesticks", []) or []):
         ts        = _get_attr(c, "end_period_ts")
@@ -649,10 +649,14 @@ def _parse_candles(resp, is_pre: bool) -> list[dict]:
         )
         if close_dollars is None:
             continue
-        vol_raw = _get_attr(c, "volume") if is_pre else _get_attr(c, "volume_fp")
+        high_raw  = _get_attr(price_obj, "high_dollars")
+        low_raw   = _get_attr(price_obj, "low_dollars")
+        vol_raw   = _get_attr(c, "volume") if is_pre else _get_attr(c, "volume_fp")
         rows.append({
             "ts":            int(ts),
             "close_dollars": round(float(close_dollars), 4),
+            "high_dollars":  round(float(high_raw), 4) if high_raw is not None else None,
+            "low_dollars":   round(float(low_raw),  4) if low_raw  is not None else None,
             "volume":        int(float(vol_raw or 0)),
         })
     return rows

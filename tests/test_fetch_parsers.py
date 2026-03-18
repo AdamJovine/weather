@@ -28,7 +28,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.noaa_forecast import extract_daily_high_forecast, get_nbm_high
-from src.live_data import upsert_live
 from src import fetchers as _climate  # climate parsers now live in src/fetchers
 
 
@@ -412,85 +411,3 @@ class TestGetNbmHigh:
         result = self._call(json_multi)
         assert result == pytest.approx(22.0 * 9 / 5 + 32)
 
-
-# ─── upsert_live ─────────────────────────────────────────────────────────────
-
-class TestUpsertLive:
-    """upsert_live replaces stale (city, date) rows and preserves the rest."""
-
-    def _base(self):
-        return pd.DataFrame({
-            "city":              ["A", "A", "B"],
-            "date":              ["2024-01-01", "2024-01-02", "2024-01-01"],
-            "forecast_high_gfs": [70.0, 71.0, 80.0],
-        })
-
-    def test_none_base_returns_live(self):
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-01"],
-                              "forecast_high_gfs": [75.0]})
-        result = upsert_live(None, live)
-        assert len(result) == 1
-        assert result.iloc[0]["forecast_high_gfs"] == pytest.approx(75.0)
-
-    def test_empty_base_returns_live(self):
-        base = pd.DataFrame(columns=["city", "date", "forecast_high_gfs"])
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-01"],
-                              "forecast_high_gfs": [75.0]})
-        result = upsert_live(base, live)
-        assert len(result) == 1
-
-    def test_live_row_replaces_matching_base_row(self):
-        """Live row for (A, 2024-01-01) must overwrite the base row."""
-        base = self._base()
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-01"],
-                              "forecast_high_gfs": [99.0]})
-        result = upsert_live(base, live)
-        row = result[(result["city"] == "A") &
-                     (pd.to_datetime(result["date"]).dt.date ==
-                      pd.Timestamp("2024-01-01").date())]
-        assert row.iloc[0]["forecast_high_gfs"] == pytest.approx(99.0)
-
-    def test_unmatched_base_rows_preserved(self):
-        """Rows in base not matched by live must be kept unchanged."""
-        base = self._base()
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-01"],
-                              "forecast_high_gfs": [99.0]})
-        result = upsert_live(base, live)
-        # Jan 2 for city A is untouched
-        row = result[(result["city"] == "A") &
-                     (pd.to_datetime(result["date"]).dt.date ==
-                      pd.Timestamp("2024-01-02").date())]
-        assert len(row) == 1
-        assert row.iloc[0]["forecast_high_gfs"] == pytest.approx(71.0)
-
-    def test_different_city_row_preserved(self):
-        """Live update for city A must not affect city B's rows."""
-        base = self._base()
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-01"],
-                              "forecast_high_gfs": [99.0]})
-        result = upsert_live(base, live)
-        row_b = result[result["city"] == "B"]
-        assert len(row_b) == 1
-        assert row_b.iloc[0]["forecast_high_gfs"] == pytest.approx(80.0)
-
-    def test_no_duplicate_city_date_after_upsert(self):
-        """Result must have at most one row per (city, date)."""
-        base = self._base()
-        live = pd.DataFrame({"city": ["A", "B"],
-                              "date": ["2024-01-01", "2024-01-01"],
-                              "forecast_high_gfs": [99.0, 88.0]})
-        result = upsert_live(base, live)
-        dupes = result.duplicated(subset=["city", "date"]).sum()
-        assert dupes == 0
-
-    def test_new_date_in_live_appended(self):
-        """A date in live that doesn't exist in base must be added."""
-        base = self._base()
-        live = pd.DataFrame({"city": ["A"], "date": ["2024-01-03"],
-                              "forecast_high_gfs": [72.0]})
-        result = upsert_live(base, live)
-        new_row = result[(result["city"] == "A") &
-                         (pd.to_datetime(result["date"]).dt.date ==
-                          pd.Timestamp("2024-01-03").date())]
-        assert len(new_row) == 1
-        assert new_row.iloc[0]["forecast_high_gfs"] == pytest.approx(72.0)

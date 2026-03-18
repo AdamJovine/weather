@@ -49,17 +49,19 @@ from typing import Optional
 
 import pandas as pd
 
+from src.app_config import cfg as _cfg
 
-DB_PATH = Path("data/weather.db")
+DB_PATH = Path(_cfg.paths.db)
 
 # (table, date_sql, max_age_days, label)
+_f = _cfg.freshness
 _FRESHNESS_CHECKS = [
-    ("weather_daily",   "MAX(date)",                           6,  "NOAA TMAX"),
-    ("forecasts_daily", "MAX(date)",                           2,  "OpenMeteo GFS"),
-    ("gefs_spread",     "MAX(date)",                           2,  "GEFS spread"),
-    ("nws_forecasts",   "MAX(target_date)",                    2,  "NWS forecasts"),
-    ("mjo_daily",       "MAX(date)",                           5,  "MJO"),
-    ("climate_monthly", "MAX(year || printf('%02d', month))",  50, "Climate indices"),
+    ("weather_daily",   "MAX(date)",                           _f.weather_daily,   "NOAA TMAX"),
+    ("forecasts_daily", "MAX(date)",                           _f.forecasts_daily, "OpenMeteo GFS"),
+    ("gefs_spread",     "MAX(date)",                           _f.gefs_spread,     "GEFS spread"),
+    ("nws_forecasts",   "MAX(target_date)",                    _f.nws_forecasts,   "NWS forecasts"),
+    ("mjo_daily",       "MAX(date)",                           _f.mjo_daily,       "MJO"),
+    ("climate_monthly", "MAX(year || printf('%02d', month))",  _f.climate_monthly, "Climate indices"),
 ]
 
 _SCHEMA = """
@@ -128,6 +130,8 @@ CREATE TABLE IF NOT EXISTS kalshi_candles (
     ts            INTEGER NOT NULL,
     close_dollars REAL,
     volume        INTEGER,
+    high_dollars  REAL,
+    low_dollars   REAL,
     PRIMARY KEY (ticker, ts),
     FOREIGN KEY (ticker) REFERENCES kalshi_markets (ticker)
 );
@@ -193,6 +197,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         ("forecasts_daily", "temp_850hpa",         "REAL"),
         ("forecasts_daily", "shortwave_radiation",  "REAL"),
         ("forecasts_daily", "dew_point_max",        "REAL"),
+        ("kalshi_candles",  "high_dollars",         "REAL"),
+        ("kalshi_candles",  "low_dollars",          "REAL"),
     ]
     for table, col, dtype in new_cols:
         try:

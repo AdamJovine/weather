@@ -3,11 +3,17 @@ BacktestConfig: all parameters that control a backtest run.
 
 Every CLI flag maps 1-to-1 to a field here so that configs are
 fully serialisable, reproducible, and easy to diff between runs.
+
+Defaults are loaded from config.yaml (project root) via src.app_config.cfg.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from src.app_config import cfg as _cfg
+
+_bc = _cfg.backtest
 
 # Registry: CLI name -> src.model class name
 MODEL_REGISTRY: dict[str, str] = {
@@ -23,90 +29,82 @@ MODEL_REGISTRY: dict[str, str] = {
     "GBResidual":       "GBResidualModel",
 }
 
-# Minimum refit cadence per model (days).
+# Minimum refit cadence per model (days) — loaded from config.yaml.
 # Linear/Bayesian models are fast enough for daily refits; tree/ensemble models
 # don't meaningfully improve with sub-weekly refitting on this data size and
 # have expensive fit costs. The effective cadence = max(user refit_every, this floor).
 MODEL_REFIT_EVERY: dict[str, int] = {
-    "GBResidual":    14,
-    "RandomForest":  14,
-    "ExtraTrees":    14,
-    "NGBoost":       14,
-    "KernelRidge":   14,
-    "QuantileGB":    14,
+    k: int(v) for k, v in vars(_bc.model_refit_floor).items()
 }
 
-DEFAULT_CITIES: list[str] = [
-    "New York", "Chicago", "Phoenix", "Miami",
-    "Denver", "Los Angeles", "Houston", "Austin",
-]
-DEFAULT_THRESHOLD_OFFSETS: list[int] = [-12, -9, -6, -3, 0, 3, 6, 9, 12]
+DEFAULT_CITIES: list[str] = list(_bc.cities)
+DEFAULT_THRESHOLD_OFFSETS: list[int] = list(_bc.threshold_offsets)
 
 
 @dataclass
 class BacktestConfig:
     # ── Run control ──────────────────────────────────────────────────────────
-    n_runs: int = 1
+    n_runs: int = _bc.n_runs
     """Number of independent runs. Run k uses seed+k so outcomes vary by
     Thompson Sampling noise. Use n_runs > 1 to measure variance / build CIs."""
 
-    seed: int = 42
+    seed: int = _bc.seed
     """Base random seed. Run k uses seed+k."""
 
     # ── Date range ───────────────────────────────────────────────────────────
-    start_date: str = "2020-01-01"
-    end_date: str = "2024-12-31"
+    start_date: str = _bc.start_date
+    end_date: str = _bc.end_date
 
     # ── Trading frequency & limits ───────────────────────────────────────────
-    sessions_per_day: int = 0
+    sessions_per_day: int = _bc.sessions_per_day
     """Maximum real hourly price snapshots to evaluate per city per day.
     0 = use all available candles (no cap).
     N > 0 = subsample N evenly-spaced snapshots from the trading window."""
 
-    max_daily_trades: int = 8
+    max_daily_trades: int = _bc.max_daily_trades
     """Hard cap: total trades across ALL cities per calendar day."""
 
-    max_session_trades: int = 4
+    max_session_trades: int = _bc.max_session_trades
     """Hard cap: trades within a single session (one evaluation pass across
     all cities). Must be <= max_daily_trades."""
 
     # ── Model ────────────────────────────────────────────────────────────────
-    model_name: str = "BayesianRidge"
+    model_name: str = _bc.model_name
     """Temperature model to use. Must be a key in MODEL_REGISTRY."""
 
-    lookback: int = 730
+    lookback: int = _bc.lookback
     """Rows of historical data per city to train on (0 = unlimited)."""
 
-    refit_every: int = 1
+    refit_every: int = _bc.refit_every
     """Refit the model every N calendar days. refit_every=1 = daily refits
     (slowest, freshest). refit_every=7 = weekly refits (7x faster)."""
 
     # ── Sizing ───────────────────────────────────────────────────────────────
-    initial_bankroll: float = 1000.0
-    kelly_fraction: float = 0.33
-    max_bet_fraction: float = 0.05
+    initial_bankroll: float = _bc.initial_bankroll
+    kelly_fraction: float = _bc.kelly_fraction
+    max_bet_fraction: float = _bc.max_bet_fraction
     max_bet_dollars: Optional[float] = None
     """Hard dollar cap per trade (applied after Kelly + fraction cap). None = no cap."""
-    fee_rate: float = 0.02
+    fee_rate: float = _bc.fee_rate
     """Kalshi fee as a fraction of winnings (applied only on winning trades)."""
 
     # ── Edge & acquisition ───────────────────────────────────────────────────
-    min_edge: float = 0.05
+    min_edge: float = _bc.min_edge
     """Minimum expected edge before placing a trade."""
 
-    min_confidence: float = 0.0
+    min_confidence: float = _bc.min_confidence
     """Only enter when fair_p >= 0.5 + min_confidence (YES) or <= 0.5 - min_confidence (NO).
     0.0 = no filter. 0.15 = model must be ≥65% confident. Controls win rate directly."""
 
-    n_thompson_draws: int = 100
+    n_thompson_draws: int = _bc.n_thompson_draws
     """Posterior samples drawn per prediction for Thompson Sampling."""
 
-    spread_alpha: float = 0.3
+    spread_alpha: float = _bc.spread_alpha
     """How much ensemble spread widens the market's sigma:
     market_sigma = climo_sigma * (1 + spread_alpha * ensemble_spread)."""
 
     # ── Scope ────────────────────────────────────────────────────────────────
-    min_train_rows: int = 365
+    min_train_rows: int = _bc.min_train_rows
     """Minimum rows of training data required before the first trade."""
 
     cities: Optional[List[str]] = None
@@ -116,44 +114,60 @@ class BacktestConfig:
     """Temperature thresholds as offsets from climo mean. None = default grid."""
 
     # ── Exit logic ───────────────────────────────────────────────────────────
-    allow_exits: bool = True
+    allow_exits: bool = _bc.allow_exits
     """When True, positions are exited early if the market price has moved to
     (or beyond) the model's fair value — i.e. no edge remains.
     When False, all positions are held to settlement (original behaviour)."""
 
-    exit_edge_threshold: float = 0.0
+    exit_edge_threshold: float = _bc.exit_edge_threshold
     """Exit a held YES position when current_price >= fair_p - exit_edge_threshold.
     0.0 = exit exactly at fair value; positive values exit slightly before fair
     value is reached (e.g. 0.02 exits when 2 cents of edge remain)."""
 
     # ── Probability band filter ───────────────────────────────────────────────
-    min_fair_p: float = 0.05
+    min_fair_p: float = _bc.min_fair_p
     """Skip entries where fair_p < min_fair_p (near-certain NO outcome)."""
 
-    max_fair_p: float = 0.95
+    max_fair_p: float = _bc.max_fair_p
     """Skip entries where fair_p > max_fair_p (near-certain YES outcome)."""
 
     # ── Execution realism ─────────────────────────────────────────────────────
-    half_spread: float = 0.01
+    half_spread: float = _bc.half_spread
     """Half the bid-ask spread in dollars, added to both yes_ask and no_ask.
-    With half_spread=0.01: yes_ask + no_ask = 1.02 (2-cent total spread),
-    matching the typical 1-2 cent spread seen on Kalshi temperature markets.
+    With half_spread=0.02: yes_ask + no_ask = 1.04 (4-cent total spread).
+    Observed data: median round-trip ~3¢ overall, but 6-12¢ in the contested
+    35-65¢ range where most trades occur. 4¢ is a conservative baseline.
     Set to 0.0 to disable spread simulation."""
 
-    min_contract_volume: float = 0.0
+    pessimistic_pricing: bool = _bc.pessimistic_pricing
+    """When True, assume worst-case fills across all candles for the settlement day.
+    For YES buys: use max(close_dollars) across all sessions (highest ask all day).
+    For NO  buys: use 1 - min(close_dollars) across all sessions (lowest NO price).
+    This gives a lower-bound on strategy performance — if it's profitable here,
+    it's robust to bad timing within the day."""
+
+    min_contract_volume: float = _bc.min_contract_volume
     """Minimum contracts traded in the candle to be eligible for entry.
     0.0 = no filter (beyond the global MIN_VOLUME=10 at load time).
     E.g. 50.0 = only trade contracts that cleared at least 50 contracts
     in that hourly snapshot — avoids stale/thin prices."""
 
+    # ── Capital management ────────────────────────────────────────────────────
+    cash_reserve_fraction: float = _bc.cash_reserve_fraction
+    """Fraction of bankroll to keep free at all times. 0.0 = no reserve."""
+
+    rotation_min_edge_gain: float = _bc.rotation_min_edge_gain
+    """Exit the lowest-edge held position when a new entry has at least this
+much more edge, freeing capital. 0.0 = no rotation."""
+
     # ── Multi-day trading ────────────────────────────────────────────────────
-    trade_tomorrow: bool = True
+    trade_tomorrow: bool = _bc.trade_tomorrow
     """When True, each trade date also evaluates the next-day settlement market
     using tomorrow's feature row — mirroring run_live.py's TOMORROW_DATE logic.
     Set to False to trade only same-day settling contracts."""
 
     # ── Output ───────────────────────────────────────────────────────────────
-    output_dir: str = "logs/backtest"
+    output_dir: str = _cfg.paths.backtest_output
     verbose: bool = False
 
     def __post_init__(self) -> None:

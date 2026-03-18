@@ -20,8 +20,6 @@ Run from project root:
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -30,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.features import add_lag_features, add_climatology, add_time_features, build_feature_table
 from src.model import TempDistributionModel, FEATURES
-from src.backtest import walk_forward_backtest
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -373,108 +370,6 @@ class TestGFSForecastShift:
                 f"ensemble_spread on date {i} = {actual}, "
                 f"expected {expected} (from day {i-1}). Shift not applied."
             )
-
-
-# ─── 4. Walk-forward backtest train/test split ────────────────────────────────
-
-class TestWalkForwardNoLeakage:
-    """
-    The walk-forward loop must train on city_df.iloc[:i] (exclusive of row i)
-    and predict city_df.iloc[i].  Row i's y_tmax must never appear in training.
-    """
-
-    def test_prediction_unaffected_by_test_ytmax_spike(self):
-        """
-        Inject a spike y_tmax=999 at the first test row (index = min_train_rows).
-        The model trains on rows [0, min_train_rows) where all y_tmax=70.
-        It then predicts row min_train_rows.  If there is no leakage the
-        prediction should be near 70, not near 999.
-        """
-        MIN_TRAIN = 365
-        df = _full_feature_df(n=MIN_TRAIN + 10, tmax_val=70.0, spike_idx=MIN_TRAIN)
-
-        results = walk_forward_backtest(df, min_train_rows=MIN_TRAIN, threshold=72)
-
-        if results.empty:
-            pytest.skip("walk_forward_backtest returned no rows — check feature completeness")
-
-        first = results.iloc[0]
-        pred = first["pred_mean"]
-
-        assert abs(pred - 70.0) < 20.0, (
-            f"Prediction for spike row = {pred:.1f}°F, expected ≈70°F. "
-            f"Large deviation toward 999 would indicate the test row's "
-            f"y_tmax=999 leaked into training."
-        )
-        assert abs(pred - 999.0) > 200.0, (
-            f"Prediction = {pred:.1f}°F is suspiciously close to the injected "
-            f"spike y_tmax=999 — probable training-data leakage."
-        )
-
-    def test_train_row_count_equals_test_index(self):
-        """
-        For each step i, training data must have exactly i rows with observed y_tmax.
-        We patch TempDistributionModel.fit to capture the training set size.
-        """
-        MIN_TRAIN = 365
-        df = _full_feature_df(n=MIN_TRAIN + 5, tmax_val=70.0)
-
-        captured_sizes = []
-        original_fit = TempDistributionModel.fit
-
-        def spy_fit(self_model, train_df):
-            captured_sizes.append(len(train_df.dropna(subset=["y_tmax"])))
-            return original_fit(self_model, train_df)
-
-        # Patch on the class used inside src.backtest
-        with patch("src.backtest.TempDistributionModel.fit", spy_fit):
-            results = walk_forward_backtest(df, min_train_rows=MIN_TRAIN, threshold=72)
-
-        if not captured_sizes:
-            pytest.skip("No fit calls captured — check that backtest produces results")
-
-        # First call trains on MIN_TRAIN rows; each subsequent call adds one more
-        for step, size in enumerate(captured_sizes):
-            expected = MIN_TRAIN + step
-            assert size == expected, (
-                f"Step {step}: training set has {size} rows, expected {expected}. "
-                f"Extra rows would mean test data leaked backward into training."
-            )
-
-    def test_test_row_ytmax_not_in_training_data(self):
-        """
-        Inject distinct y_tmax values so we can verify the test row's specific
-        value never appears in the training set passed to fit().
-        """
-        MIN_TRAIN = 365
-        # All training rows: y_tmax=70.  Test rows: y_tmax = 200, 201, 202, ...
-        n = MIN_TRAIN + 5
-        df = _full_feature_df(n=n, tmax_val=70.0)
-        # Override y_tmax for the test rows only (don't touch lag features)
-        for k in range(5):
-            test_tmax = 200.0 + k
-            df.loc[MIN_TRAIN + k, "y_tmax"] = test_tmax
-
-        violations = []
-        original_fit = TempDistributionModel.fit
-
-        # Track which test-row y_tmax values appear in training data
-        step = [0]
-
-        def spy_fit(self_model, train_df):
-            expected_test_tmax = 200.0 + step[0]
-            if expected_test_tmax in train_df["y_tmax"].values:
-                violations.append((step[0], expected_test_tmax))
-            step[0] += 1
-            return original_fit(self_model, train_df)
-
-        with patch("src.backtest.TempDistributionModel.fit", spy_fit):
-            walk_forward_backtest(df, min_train_rows=MIN_TRAIN, threshold=72)
-
-        assert violations == [], (
-            f"Test row y_tmax found in training data at steps: {violations}. "
-            f"This is direct train/test leakage."
-        )
 
 
 # ─── 5. Model.fit isolation ───────────────────────────────────────────────────

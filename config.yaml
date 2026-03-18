@@ -1,0 +1,149 @@
+# config.yaml — Operational configuration for the weather trading system.
+#
+# Hyperparameter-tuned values (kelly_fraction, min_edge, spread_alpha, etc.)
+# are discovered by scripts/mega_tune.py and saved to
+# logs/mega_tune/{Model}/best.json. The defaults here apply when running
+# backtests or scripts directly, outside of the tuner.
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+  db: data/weather.db
+  stations: data/stations.csv
+  tune_output: logs/mega_tune
+  backtest_output: logs/backtest
+
+# ── Live trading ──────────────────────────────────────────────────────────────
+live:
+  model_name: BaggingRidge
+  bankroll: 100.0
+  cash_reserve_fraction: 0.20
+  rotation_min_edge_gain: 0.02
+  max_bet_dollars: 10.0           # hard dollar cap per trade — no single bet can exceed this
+  kalshi_rate_sleep: 0.5          # seconds between Kalshi API calls
+  target_date_cutoff_hour: 16     # before this hour trade same-day; after, trade tomorrow
+
+# ── Temperature model ─────────────────────────────────────────────────────────
+model:
+  temp_grid_min: -20
+  temp_grid_max: 129
+  ridge_alpha: 1.0
+  spread_alpha: 0.3               # default ensemble spread → sigma multiplier
+  feature_epoch: "2018-01-01"     # reference date for days_since feature
+  max_lag_gap_days: 7             # gaps larger than this nullify lag features
+  train_start: "2018-01-01"
+  train_end: "2025-12-31"
+
+# ── Portfolio / risk defaults ─────────────────────────────────────────────────
+portfolio:
+  trade_fee_buffer: 0.02          # estimated Kalshi fee fraction
+  trade_model_buffer: 0.03        # minimum model edge above fee before entry
+  kelly_fraction: 0.33
+  max_bet_fraction: 0.05
+  min_bet_dollars: 1.0
+  city_multiplier_cap: 2.0
+
+# ── Backtest defaults ─────────────────────────────────────────────────────────
+backtest:
+  start_date: "2020-01-01"
+  end_date: "2024-12-31"
+  n_runs: 1
+  seed: 42
+  sessions_per_day: 0             # 0 = use all available candles
+  max_daily_trades: 8
+  max_session_trades: 4
+  model_name: BayesianRidge
+  lookback: 730                   # rows of history per city to train on
+  refit_every: 1                  # model refit cadence in calendar days
+  initial_bankroll: 1000.0
+  kelly_fraction: 0.33
+  max_bet_fraction: 0.05
+  fee_rate: 0.02
+  min_edge: 0.05
+  min_confidence: 0.0
+  n_thompson_draws: 100
+  spread_alpha: 0.3
+  min_train_rows: 365
+  allow_exits: true
+  exit_edge_threshold: 0.0
+  min_fair_p: 0.05
+  max_fair_p: 0.95
+  half_spread: 0.02               # half the bid-ask spread in dollars
+  pessimistic_pricing: true
+  min_contract_volume: 0.0
+  cash_reserve_fraction: 0.0
+  rotation_min_edge_gain: 0.0
+  trade_tomorrow: true
+  cities:
+    - New York
+    - Chicago
+    - Phoenix
+    - Miami
+    - Denver
+    - Los Angeles
+    - Houston
+    - Austin
+  threshold_offsets: [-12, -9, -6, -3, 0, 3, 6, 9, 12]
+  # Minimum refit cadence floor per model (days).
+  # Effective cadence = max(user refit_every, this floor).
+  model_refit_floor:
+    GBResidual: 14
+    RandomForest: 14
+    ExtraTrees: 14
+    NGBoost: 14
+    KernelRidge: 14
+    QuantileGB: 14
+
+# ── Hyperparameter tuning (tune_hyperparams.py) ───────────────────────────────
+tuning:
+  start_date: "2022-01-01"
+  end_date: "2024-12-31"
+  refit_every: 14                 # bi-weekly model refits for speed
+  sessions_per_day: 1             # first candle per day only
+  max_daily_trades: 4
+  max_session_trades: 2
+  min_train_rows: 365
+  fee_rate: 0.02
+  cash_reserve_fraction: 0.20
+  rotation_min_edge_gain: 0.02
+  initial_bankroll: 100.0
+
+# ── Mega tune (mega_tune.py) ──────────────────────────────────────────────────
+mega_tune:
+  n_rounds: 50
+  n_init: 10
+  seed: 0
+  start_date: "2025-12-01"
+  end_date: "2026-03-15"
+  max_bet_dollars: 1.0           # hard dollar cap per trade per session
+  max_session_trades: 4           # trades per candle / interval (matches live trading)
+  max_daily_trades: 100
+  refit_every: 1
+  fee_rate: 0.02
+  cash_reserve_fraction: 0.20
+  rotation_min_edge_gain: 0.02
+  initial_bankroll: 100.0
+  n_jobs: 2
+  timeout_secs: 900               # blacklist model if single eval exceeds this
+
+# ── Data validation thresholds ────────────────────────────────────────────────
+validation:
+  tmax_min: -60.0
+  tmax_max: 140.0
+  max_gap_days: 14
+  max_nan_rate: 0.30
+  max_obs_nan_rate: 0.05
+
+# ── Market data quality filters ───────────────────────────────────────────────
+market_data:
+  price_min: 0.01
+  price_max: 0.99
+  min_volume: 10                  # skip candles with fewer contracts than this
+
+# ── Data freshness thresholds (max age in days before warning) ────────────────
+freshness:
+  weather_daily: 6
+  forecasts_daily: 2
+  gefs_spread: 2
+  nws_forecasts: 2
+  mjo_daily: 5
+  climate_monthly: 50

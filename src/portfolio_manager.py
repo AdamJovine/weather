@@ -101,6 +101,7 @@ class PortfolioManager:
         min_contract_volume: float = 0.0,
         cash_reserve_fraction: float = 0.0,
         rotation_min_edge_gain: float = 0.0,
+        max_session_trades: Optional[int] = None,
     ) -> None:
         self.kelly_fraction = kelly_fraction
         self.max_bet_fraction = max_bet_fraction
@@ -116,6 +117,7 @@ class PortfolioManager:
         self.min_contract_volume = min_contract_volume
         self.cash_reserve_fraction = cash_reserve_fraction
         self.rotation_min_edge_gain = rotation_min_edge_gain
+        self.max_session_trades = max_session_trades
 
     @classmethod
     def from_config(cls, cfg) -> "PortfolioManager":
@@ -169,6 +171,7 @@ class PortfolioManager:
         bankroll: float,
         city_multipliers: dict[str, float] | None = None,
         ticker_cost: dict[str, float] | None = None,
+        session_slots: Optional[int] = None,
     ) -> list[OrderIntent]:
         """
         Evaluate all markets for this cycle and return trade intents.
@@ -184,6 +187,10 @@ class PortfolioManager:
         positions       ticker → net YES contracts (+yes, -no); absent = flat
         bankroll        Current available capital
         city_multipliers  Optional UCB multipliers keyed by city name
+        session_slots   Max buy intents to return this call.  Overrides
+                        self.max_session_trades; use when splitting a session
+                        budget across multiple evaluate() calls (e.g. today +
+                        tomorrow).  None = use self.max_session_trades.
         """
         if city_multipliers is None:
             city_multipliers = {}
@@ -192,6 +199,12 @@ class PortfolioManager:
         buys  = self._evaluate_entries(markets, pred_rows, positions, bankroll, city_multipliers, ticker_cost)
         if self.cash_reserve_fraction > 0 or self.rotation_min_edge_gain > 0:
             sells, buys = self._apply_capital_management(sells, buys, markets, pred_rows, positions, bankroll)
+
+        # Enforce per-session trade limit (buys already sorted by edge desc).
+        limit = session_slots if session_slots is not None else self.max_session_trades
+        if limit is not None:
+            buys = buys[:limit]
+
         return sells + buys
 
     # ── exit logic ────────────────────────────────────────────────────────────

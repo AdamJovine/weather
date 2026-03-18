@@ -58,6 +58,8 @@ BANKROLL               = _cfg.live.bankroll
 CASH_RESERVE_FRACTION  = _cfg.live.cash_reserve_fraction
 ROTATION_MIN_EDGE_GAIN = _cfg.live.rotation_min_edge_gain
 MAX_BET_DOLLARS        = _cfg.live.max_bet_dollars
+MAX_SESSION_TRADES     = _cfg.live.max_session_trades
+MAX_DAILY_TRADES       = _cfg.live.max_daily_trades
 
 OUT_ROOT      = Path(_cfg.paths.tune_output)
 STATIONS_FILE = Path(_cfg.paths.stations)
@@ -454,6 +456,7 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
         min_confidence=float(_BEST["min_confidence"]),
         cash_reserve_fraction=CASH_RESERVE_FRACTION,
         rotation_min_edge_gain=ROTATION_MIN_EDGE_GAIN,
+        max_session_trades=MAX_SESSION_TRADES,
     )
     city_multipliers = {
         city: city_ucb.kelly_multiplier(city)
@@ -475,8 +478,16 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
 
     # 7. Evaluate all markets via PortfolioManager (exits first, then entries)
     # Run separately per date so each uses the correct prediction distribution.
-    intents_today = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers)
-    intents_tmrw  = pm.evaluate(weather_markets_tmrw, pred_rows_tmrw, positions, BANKROLL, city_multipliers)
+    # Both the bankroll budget and the per-session trade count are split across
+    # the two calls so today + tomorrow together count as one session.
+    intents_today = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers,
+                                session_slots=MAX_SESSION_TRADES)
+    buys_used_today = sum(1 for i in intents_today if i.action == "buy")
+    deployed_today  = sum(i.size for i in intents_today if i.action == "buy")
+    bankroll_remaining = max(0.0, BANKROLL - deployed_today)
+    slots_remaining    = max(0, MAX_SESSION_TRADES - buys_used_today)
+    intents_tmrw = pm.evaluate(weather_markets_tmrw, pred_rows_tmrw, positions, bankroll_remaining,
+                               city_multipliers, session_slots=slots_remaining)
     intents = intents_today + intents_tmrw
 
     sell_intents = [i for i in intents if i.action == "sell"]
@@ -597,10 +608,13 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
                     order_price = live_ask
                 else:
                     order_price = intent.price
+                # Recompute contract count at the actual order price so that
+                # max_bet_dollars is enforced on what we actually spend.
+                order_count = max(1, round(intent.size / order_price))
                 resp = kalshi.place_order(
                     ticker=intent.ticker,
                     side=intent.side,
-                    count=max(1, round(intent.contracts)),
+                    count=order_count,
                     price=int(round(order_price * 100)),
                 )
                 print(f"  Order placed: {resp}")

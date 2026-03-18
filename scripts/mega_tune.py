@@ -16,7 +16,7 @@ Evaluation settings (fixed, not tuned)
   sessions_per_day  = 0   → all available hourly candles (≈ 30-min intervals)
   refit_every       = 1   → daily model refresh with latest observations
   max_bet_dollars   = 10  → hard $10 cap per trade per session
-  max_session_trades= 1   → one bet per candle / interval
+  max_session_trades= 4   → four bets per candle / interval (matches live)
   fee_rate          = 0.02→ 2% Kalshi fee on winnings
 
 Per-model tunable parameters (in addition to shared params)

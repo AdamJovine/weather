@@ -18,7 +18,9 @@ live:
   bankroll: 100.0
   cash_reserve_fraction: 0.20
   rotation_min_edge_gain: 0.02
-  max_bet_dollars: 10.0           # hard dollar cap per trade — no single bet can exceed this
+  max_bet_dollars: 1.0            # hard dollar cap per trade — no single bet can exceed this
+  max_session_trades: 4           # max buy orders per 30-min interval (matches mega_tune)
+  max_daily_trades: 100           # max buy orders per calendar day (matches mega_tune)
   kalshi_rate_sleep: 0.5          # seconds between Kalshi API calls
   target_date_cutoff_hour: 16     # before this hour trade same-day; after, trade tomorrow
 

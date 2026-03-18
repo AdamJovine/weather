@@ -179,7 +179,8 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
     if not best_path.exists():
         print(f"ERROR: no best.json for model '{model_name}' at {best_path}")
         sys.exit(1)
-    _BEST = json.load(open(best_path))["params"]
+    _best_doc = json.load(open(best_path))
+    _BEST = _best_doc["params"]
     _model_module.SPREAD_ALPHA = float(_BEST["spread_alpha"])
 
     _now = _dt.now()
@@ -422,14 +423,21 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
     weather_markets_tmrw = fetch_weather_markets(auth, tradeable_stations, TOMORROW_DATE)
     print(f"  {len(weather_markets_tmrw)} markets for {TOMORROW_DATE}.\n")
 
-    # Load UCB city allocation state
+    # Load UCB city allocation state.
+    # Warm-start from the best trial's trades CSV, which lives alongside best.json.
+    # best.json records n_evals (the trial number of the best result) so we can
+    # reconstruct the exact path: <best_dir>/trial_NNNN_trades.csv
     city_ucb = CityUCB(cities=tradeable_stations["city"].tolist())
     city_ucb.load_state()
-    backtest_trades_path = Path("logs/pnl_backtest_trades.csv")
+    best_n_evals = int(_best_doc.get("n_evals", 0))
+    backtest_trades_path = best_path.parent / f"trial_{best_n_evals:04d}_trades.csv"
     if backtest_trades_path.exists():
         bt_trades = pd.read_csv(backtest_trades_path)
         if {"city", "pnl", "size"}.issubset(bt_trades.columns):
             city_ucb.initialize_from_backtest(bt_trades)
+            print(f"UCB warm-started from {backtest_trades_path} ({len(bt_trades)} trades)")
+    else:
+        print(f"UCB: no backtest trades found at {backtest_trades_path} — starting cold")
     ucb_summary = city_ucb.summary()
     print("UCB city multipliers:")
     for city_name, info in sorted(ucb_summary.items(), key=lambda x: -x[1]["multiplier"]):
@@ -454,6 +462,9 @@ def main(dry_run: bool = True, model_name: str = _cfg.live.model_name, best_json
         max_bet_dollars=MAX_BET_DOLLARS,
         min_edge=float(_BEST["min_edge"]),
         min_confidence=float(_BEST["min_confidence"]),
+        min_fair_p=float(_BEST.get("min_fair_p", 0.05)),
+        max_fair_p=float(_BEST.get("max_fair_p", 0.95)),
+        min_mkt_price=float(_BEST.get("min_mkt_price", 0.0)),
         cash_reserve_fraction=CASH_RESERVE_FRACTION,
         rotation_min_edge_gain=ROTATION_MIN_EDGE_GAIN,
         max_session_trades=MAX_SESSION_TRADES,

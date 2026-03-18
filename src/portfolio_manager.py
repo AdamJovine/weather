@@ -102,6 +102,7 @@ class PortfolioManager:
         cash_reserve_fraction: float = 0.0,
         rotation_min_edge_gain: float = 0.0,
         max_session_trades: Optional[int] = None,
+        min_mkt_price: float = 0.0,
     ) -> None:
         self.kelly_fraction = kelly_fraction
         self.max_bet_fraction = max_bet_fraction
@@ -118,6 +119,7 @@ class PortfolioManager:
         self.cash_reserve_fraction = cash_reserve_fraction
         self.rotation_min_edge_gain = rotation_min_edge_gain
         self.max_session_trades = max_session_trades
+        self.min_mkt_price = min_mkt_price
 
     @classmethod
     def from_config(cls, cfg) -> "PortfolioManager":
@@ -133,6 +135,7 @@ class PortfolioManager:
             min_fair_p=getattr(cfg, "min_fair_p", 0.05),
             max_fair_p=getattr(cfg, "max_fair_p", 0.95),
             min_contract_volume=getattr(cfg, "min_contract_volume", 0.0),
+            min_mkt_price=getattr(cfg, "min_mkt_price", 0.0),
             cash_reserve_fraction=getattr(cfg, "cash_reserve_fraction", 0.0),
             rotation_min_edge_gain=getattr(cfg, "rotation_min_edge_gain", 0.0),
         )
@@ -412,6 +415,15 @@ class PortfolioManager:
             no_ask  = float(market.get("no_ask_dollars")  or 0)
             if yes_ask <= 0 or no_ask <= 0:
                 continue
+
+            # Skip contracts where the market price of the side we'd buy is too low.
+            # A 1-2¢ ask means the market is highly skeptical; our model is unlikely
+            # to be right when it disagrees this strongly with the consensus.
+            if self.min_mkt_price > 0:
+                if fair_p > 0.5 and yes_ask < self.min_mkt_price:
+                    continue
+                if fair_p <= 0.5 and no_ask < self.min_mkt_price:
+                    continue
 
             # Skip illiquid contracts — use candle volume (backtest) or
             # volume_fp (live Kalshi API); absent = pass through (no filter)

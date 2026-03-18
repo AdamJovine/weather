@@ -235,6 +235,7 @@ def main():
             min_confidence   = float(params["min_confidence"]),
             min_fair_p       = float(params.get("min_fair_p", 0.05)),
             max_fair_p       = float(params.get("max_fair_p", 0.95)),
+            min_mkt_price    = float(params.get("min_mkt_price", 0.0)),
         )
         intents = pm.evaluate(weather_markets, pred_rows, positions, BANKROLL, city_multipliers)
         buys    = [i for i in intents if i.action == "buy"]

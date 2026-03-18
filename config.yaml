@@ -72,6 +72,7 @@ backtest:
   half_spread: 0.02               # half the bid-ask spread in dollars
   pessimistic_pricing: true
   min_contract_volume: 0.0
+  min_mkt_price: 0.0              # min market ask for the side we'd buy (0 = disabled)
   cash_reserve_fraction: 0.0
   rotation_min_edge_gain: 0.0
   trade_tomorrow: true

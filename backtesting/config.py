@@ -152,6 +152,11 @@ class BacktestConfig:
     E.g. 50.0 = only trade contracts that cleared at least 50 contracts
     in that hourly snapshot — avoids stale/thin prices."""
 
+    min_mkt_price: float = _bc.min_mkt_price
+    """Minimum market ask price for the side we'd buy (YES ask for YES trades,
+    NO ask for NO trades).  Contracts priced below this are skipped — the market
+    is too skeptical to trust our model.  E.g. 0.10 blocks all 1-9¢ contracts."""
+
     # ── Capital management ────────────────────────────────────────────────────
     cash_reserve_fraction: float = _bc.cash_reserve_fraction
     """Fraction of bankroll to keep free at all times. 0.0 = no reserve."""

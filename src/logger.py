@@ -15,6 +15,26 @@ TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 FORECAST_LOG_PATH = LOG_DIR / "forecast_log.csv"
 MARKET_SNAPSHOT_PATH = LOG_DIR / "market_snapshots.csv"
 
+
+def init_run(model_name: str = "") -> None:
+    """Set log paths to a unique timestamped name for this run.
+
+    Call once at process startup (before any logging) so each invocation
+    of run_live.py writes to its own files instead of appending to a shared log.
+
+    Example output:
+        logs/trade_log_20260318_143000_ARD.csv
+        logs/forecast_log_20260318_143000_ARD.csv
+        logs/market_snapshots_20260318_143000_ARD.csv
+    """
+    global TRADE_LOG_PATH, FORECAST_LOG_PATH, MARKET_SNAPSHOT_PATH
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{ts}_{model_name}" if model_name else f"_{ts}"
+    TRADE_LOG_PATH = LOG_DIR / f"trade_log{suffix}.csv"
+    FORECAST_LOG_PATH = LOG_DIR / f"forecast_log{suffix}.csv"
+    MARKET_SNAPSHOT_PATH = LOG_DIR / f"market_snapshots{suffix}.csv"
+    print(f"Run logs: {TRADE_LOG_PATH.name}")
+
 TRADE_LOG_FIELDS = [
     "timestamp", "market_ticker", "city", "market_type", "contract_desc",
     "fair_p", "yes_ask", "no_ask", "edge_yes", "edge_no",

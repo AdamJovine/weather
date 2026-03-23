@@ -36,6 +36,7 @@ from src.db import get_db, upsert_df, read_df
 from src.fetchers import (
     fetch_ao, fetch_nao, fetch_oni, fetch_pna, fetch_pdo, fetch_mjo,
     fetch_city_forecast, fetch_gefs_spread, fetch_obs_actuals,
+    fetch_recent_actuals,
     fetch_settled_markets_post, fetch_settled_markets_pre,
     fetch_candlesticks, parse_settlement_date,
     KALSHI_RATE_SLEEP,
@@ -152,7 +153,52 @@ def update_obs(conn) -> None:
         time.sleep(0.4)
 
     conn.commit()
-    print(f"  [obs] done — {total_new} new rows written")
+    print(f"  [obs] ERA5 pass done — {total_new} new rows written")
+
+    # --- Second pass: fill the ERA5→yesterday gap via forecast API -----------
+    # The OpenMeteo forecast API provides analyzed temperatures for the last
+    # ~5 days with only ~1-day lag, covering the window ERA5 hasn't reached.
+    yesterday = str(today - timedelta(days=1))
+    recent_start = str(today - timedelta(days=ERA5_LAG_DAYS - 1))
+
+    # Re-read existing after ERA5 pass
+    existing = read_df(conn, "weather_daily")
+
+    recent_new = 0
+    print(f"\n  Filling ERA5 gap ({recent_start} → {yesterday}) via forecast API...")
+    for _, row in stations.iterrows():
+        city     = row["city"]
+        lat, lon = row["lat"], row["lon"]
+        tz       = row["timezone"]
+
+        city_existing = existing[existing["city"] == city] if not existing.empty else pd.DataFrame()
+        city_dates = set(pd.to_datetime(city_existing["date"]).dt.date) if not city_existing.empty else set()
+
+        # Only fetch dates we're actually missing
+        gap_dates = {
+            today - timedelta(days=d)
+            for d in range(1, ERA5_LAG_DAYS)
+        } - city_dates
+        if not gap_dates:
+            print(f"  {city}: up to date")
+            continue
+
+        gap_start = str(min(gap_dates))
+        gap_end = str(max(gap_dates))
+        print(f"  {city}: {gap_start} → {gap_end}", end=" ", flush=True)
+        try:
+            df = fetch_recent_actuals(city, lat, lon, tz, gap_start, gap_end)
+            if not df.empty and city_dates:
+                df = df[~df["date"].isin(city_dates)]
+            n = upsert_df(conn, "weather_daily", df) if not df.empty else 0
+            recent_new += n
+            print(f"→ {n} rows")
+        except Exception as e:
+            print(f"→ ERROR: {e}")
+        time.sleep(0.4)
+
+    conn.commit()
+    print(f"  [obs] recent gap fill done — {recent_new} new rows written")
 
 
 # ─── OpenMeteo GFS / ECMWF ───────────────────────────────────────────────────
@@ -213,13 +259,12 @@ def update_gfs(conn) -> None:
             city_max  = city_rows["date"].max()
             covered_end = str(city_max)
 
-            # If new data columns exist in schema but are entirely NULL for this city,
-            # the migration ran but no data was fetched yet — force full re-fetch.
+            # If any new data column is entirely NULL for this city,
+            # the migration ran but data wasn't fetched yet — force full re-fetch.
             data_cols_present = [c for c in NEW_DATA_COLS if c in city_rows.columns]
-            needs_backfill = (
-                data_cols_present
-                and not city_rows[data_cols_present].notna().any(axis=None)
-            )
+            needs_backfill = any(
+                not city_rows[col].notna().any() for col in data_cols_present
+            ) if data_cols_present else False
 
             if needs_backfill:
                 fetch_start = TRAIN_START

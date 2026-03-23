@@ -106,7 +106,7 @@ _SHARED_PARAMS = [
     ("max_fair_p",      "linear", 0.80,  0.98),
     ("sigma_floor",     "linear", 2.0,   7.0),   # minimum predictive sigma — prevents overconfidence on tail events
     # Market price floor — skip contracts where market is too skeptical to trust model
-    ("min_mkt_price",   "linear", 0.00,  0.30),
+    ("min_mkt_price",   "linear", 0.02,  0.30),
 ]
 
 SEARCH_SPACES = {

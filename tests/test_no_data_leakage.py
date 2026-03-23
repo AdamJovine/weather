@@ -27,7 +27,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.features import add_lag_features, add_climatology, add_time_features, build_feature_table
-from src.model import TempDistributionModel, FEATURES
+from src.model import BayesianTempModel, FEATURES
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -398,9 +398,9 @@ class TestModelFitIsolation:
         Leakage would shift the prediction toward 999.
         """
         train_df, test_df = self._make_split()
-        model = TempDistributionModel()
+        model = BayesianTempModel()
         model.fit(train_df)
-        pred = model.predict_mean(test_df)[0]
+        pred = model.predict_with_uncertainty(test_df)[0][0]
 
         assert abs(pred - 70.0) < 15.0, (
             f"Prediction = {pred:.2f}°F, expected ≈70°F. "
@@ -424,7 +424,7 @@ class TestModelFitIsolation:
         With clean training data (all y_tmax=70), sigma_ must be small.
         """
         train_df, _ = self._make_split()
-        model = TempDistributionModel()
+        model = BayesianTempModel()
         model.fit(train_df)
 
         assert model.sigma_ < 10.0, (
@@ -435,10 +435,10 @@ class TestModelFitIsolation:
 
     def test_model_is_not_fit_raises_before_fit(self):
         """Sanity: predict before fit must raise RuntimeError, not silently use stale state."""
-        model = TempDistributionModel()
+        model = BayesianTempModel()
         _, test_df = self._make_split()
         with pytest.raises(RuntimeError):
-            model.predict_mean(test_df)
+            model.predict_with_uncertainty(test_df)
 
 
 # ─── 6. Known limitations (documented, not bugs) ─────────────────────────────

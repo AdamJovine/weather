@@ -8,6 +8,7 @@ logs/*.json
 logs/mega_tune/
 logs/backtest/
 logs/forecast_backtest/
+logs/runs/
 
 # Cache
 .cache/

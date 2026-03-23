@@ -64,6 +64,7 @@ from backtesting.data_loader import BacktestDataset
 from backtesting.market_data import KalshiPriceStore, Session
 from backtesting.portfolio import Portfolio, Trade, OpenPosition
 from src.portfolio_manager import PortfolioManager, OrderIntent
+from src.strategy import contract_yes_outcome
 
 # A model factory is any callable that takes no arguments and returns a
 # fitted-model-ready instance. Used by the hyperparameter tuner to inject
@@ -455,13 +456,9 @@ def _build_trade_from_intent(
     y_tmax = float(test_row["y_tmax"])
     cd = intent.contract_def
 
-    if cd["market_type"] == "geq":
-        outcome_yes = int(y_tmax >= cd["threshold"])
-    elif cd["market_type"] == "leq":
-        outcome_yes = int(y_tmax <= cd["threshold"])
-    elif cd["market_type"] == "range":
-        outcome_yes = int(cd["low"] <= y_tmax <= cd["high"])
-    else:
+    try:
+        outcome_yes = contract_yes_outcome(cd, y_tmax)
+    except ValueError:
         return None
 
     side = intent.side
@@ -566,13 +563,9 @@ def _build_settlement_trade(
     y_tmax = float(test_row["y_tmax"])
     cd = pos.contract_def
 
-    if pos.contract_type == "geq":
-        outcome_yes = int(y_tmax >= cd["threshold"])
-    elif pos.contract_type == "leq":
-        outcome_yes = int(y_tmax <= cd["threshold"])
-    elif pos.contract_type == "range":
-        outcome_yes = int(cd["low"] <= y_tmax <= cd["high"])
-    else:
+    try:
+        outcome_yes = contract_yes_outcome(cd, y_tmax)
+    except ValueError:
         raise ValueError(
             f"_build_settlement_trade: unknown contract_type {pos.contract_type!r} "
             f"for ticker {pos.ticker!r} (city={city}, entry_date={pos.entry_date}). "

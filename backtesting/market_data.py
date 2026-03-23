@@ -45,6 +45,8 @@ class ParsedContract:
     One tradeable contract at a specific price snapshot.
 
     contract_def mirrors what parse_contract() returns:
+      gt    → {"market_type": "gt",  "threshold": int}
+      lt    → {"market_type": "lt",  "threshold": int}
       geq   → {"market_type": "geq", "threshold": int}
       leq   → {"market_type": "leq", "threshold": int}
       range → {"market_type": "range", "low": int, "high": int}

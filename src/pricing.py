@@ -4,6 +4,8 @@ Convert model probability distributions to fair values for Kalshi contract types
 Contract types:
   exact:  P(tmax == k)
   range:  P(low <= tmax <= high)
+  gt:     P(tmax > threshold)
+  lt:     P(tmax < threshold)
   geq:    P(tmax >= threshold)
   leq:    P(tmax <= threshold)
 """
@@ -38,6 +40,17 @@ def fair_prob_geq(
     )
 
 
+def fair_prob_gt(
+    prob_row: pd.Series,
+    threshold: int,
+    max_temp: int = TEMP_GRID_MAX,
+) -> float:
+    return sum(
+        float(prob_row.get(f"temp_{k}", 0.0))
+        for k in range(threshold + 1, max_temp + 1)
+    )
+
+
 def fair_prob_leq(
     prob_row: pd.Series,
     threshold: int,
@@ -49,21 +62,36 @@ def fair_prob_leq(
     )
 
 
+def fair_prob_lt(
+    prob_row: pd.Series,
+    threshold: int,
+    min_temp: int = TEMP_GRID_MIN,
+) -> float:
+    return sum(
+        float(prob_row.get(f"temp_{k}", 0.0))
+        for k in range(min_temp, threshold)
+    )
+
+
 def compute_fair_prob(prob_row: pd.Series, contract: dict) -> float:
     """
     Dispatch to the correct pricing function based on contract type.
 
     contract dict keys:
-      market_type: "exact" | "range" | "geq" | "leq"
+      market_type: "exact" | "range" | "gt" | "lt" | "geq" | "leq"
       temp_value:  int           (exact)
       low, high:   int, int      (range)
-      threshold:   int           (geq / leq)
+      threshold:   int           (gt / lt / geq / leq)
     """
     mtype = contract["market_type"]
     if mtype == "exact":
         return fair_prob_exact(prob_row, contract["temp_value"])
     elif mtype == "range":
         return fair_prob_range(prob_row, contract["low"], contract["high"])
+    elif mtype == "gt":
+        return fair_prob_gt(prob_row, contract["threshold"])
+    elif mtype == "lt":
+        return fair_prob_lt(prob_row, contract["threshold"])
     elif mtype == "geq":
         return fair_prob_geq(prob_row, contract["threshold"])
     elif mtype == "leq":

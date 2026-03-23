@@ -75,21 +75,21 @@ def spike_prob_row(temp: int) -> pd.Series:
 print("\n=== parse_contract: Kalshi '> N°' format ===")
 check(">30° (be >30°)",
       parse_contract("Will the high temp be >30° on Mar 17?"),
-      {"market_type": "geq", "threshold": 31})
+      {"market_type": "gt", "threshold": 30})
 
 check("> 72° with space",
       parse_contract("high temp be > 72°"),
-      {"market_type": "geq", "threshold": 73})
+      {"market_type": "gt", "threshold": 72})
 
 
 print("\n=== parse_contract: Kalshi '< N°' format ===")
 check("<23° (be <23°)",
       parse_contract("Will the high temp be <23° on Mar 17?"),
-      {"market_type": "leq", "threshold": 22})
+      {"market_type": "lt", "threshold": 23})
 
 check("< 50° with space",
       parse_contract("high temp be < 50°"),
-      {"market_type": "leq", "threshold": 49})
+      {"market_type": "lt", "threshold": 50})
 
 
 print("\n=== parse_contract: range with hyphen '29-30°' ===")
@@ -210,6 +210,13 @@ check("range(63,66) | uniform[60,69] → 0.4", round(p, 6), 0.4)
 p_geq = compute_fair_prob(row_uniform, {"market_type": "geq", "threshold": 63})
 p_leq = compute_fair_prob(row_uniform, {"market_type": "leq", "threshold": 62})
 check("geq(63) + leq(62) = 1.0 | uniform[60,69]", round(p_geq + p_leq, 6), 1.0)
+
+# strict inequalities
+p = compute_fair_prob(row_uniform, {"market_type": "gt", "threshold": 64})
+check("gt(64) | uniform[60,69] → 0.5", round(p, 6), 0.5)
+
+p = compute_fair_prob(row_uniform, {"market_type": "lt", "threshold": 65})
+check("lt(65) | uniform[60,69] → 0.5", round(p, 6), 0.5)
 
 
 # ===========================================================================

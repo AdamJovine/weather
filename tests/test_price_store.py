@@ -38,6 +38,7 @@ from src.db import get_db
 from backtesting.market_data import KalshiPriceStore
 from backtesting.engine import _build_trade_from_intent, _build_settlement_trade
 from src.portfolio_manager import OrderIntent
+from src.strategy import contract_yes_outcome
 
 
 # ─── Timestamps (UTC Unix seconds) ────────────────────────────────────────────
@@ -112,14 +113,7 @@ class _FakePortfolio:
 
 def _outcome_yes(y_tmax: float, contract_def: dict) -> int:
     """Mirrors engine.py outcome logic — used to verify correctness."""
-    mt = contract_def["market_type"]
-    if mt == "geq":
-        return int(y_tmax >= contract_def["threshold"])
-    if mt == "leq":
-        return int(y_tmax <= contract_def["threshold"])
-    if mt == "range":
-        return int(contract_def["low"] <= y_tmax <= contract_def["high"])
-    raise ValueError(f"Unknown market_type: {mt}")
+    return contract_yes_outcome(contract_def, y_tmax)
 
 
 def _make_intent(ticker, title, side, price, contract_def, size=10.0):
@@ -425,9 +419,13 @@ class TestSettlementOutcome:
         cd = {"market_type": "geq", "threshold": 65}
         assert _outcome_yes(72.0, cd) == 1
 
-    def test_geq_no_when_tmax_below_threshold(self):
+    def test_geq_no_when_tmax_below_threshold_even_if_close(self):
         cd = {"market_type": "geq", "threshold": 65}
-        assert _outcome_yes(64.9, cd) == 0   # strictly below threshold → NO
+        assert _outcome_yes(64.9, cd) == 0
+
+    def test_geq_no_when_tmax_more_than_half_degree_below_threshold(self):
+        cd = {"market_type": "geq", "threshold": 65}
+        assert _outcome_yes(64.4, cd) == 0
 
     def test_geq_no_when_tmax_just_below_threshold(self):
         cd = {"market_type": "geq", "threshold": 65}
@@ -447,6 +445,18 @@ class TestSettlementOutcome:
         cd = {"market_type": "leq", "threshold": 40}
         assert _outcome_yes(41.0, cd) == 0
 
+    # ── strict gt/lt contracts ───────────────────────────────────────────────
+
+    def test_gt_is_strictly_greater_than(self):
+        cd = {"market_type": "gt", "threshold": 56}
+        assert _outcome_yes(56.0, cd) == 0
+        assert _outcome_yes(56.1, cd) == 1
+
+    def test_lt_is_strictly_less_than(self):
+        cd = {"market_type": "lt", "threshold": 56}
+        assert _outcome_yes(56.0, cd) == 0
+        assert _outcome_yes(55.9, cd) == 1
+
     # ── range contracts ───────────────────────────────────────────────────────
 
     def test_range_yes_when_tmax_equals_low_bound(self):
@@ -461,9 +471,13 @@ class TestSettlementOutcome:
         cd = {"market_type": "range", "low": 30, "high": 35}
         assert _outcome_yes(32.5, cd) == 1
 
-    def test_range_no_when_tmax_below_low(self):
+    def test_range_no_when_tmax_below_low_even_if_close(self):
         cd = {"market_type": "range", "low": 30, "high": 31}
         assert _outcome_yes(29.9, cd) == 0
+
+    def test_range_no_when_tmax_below_low_by_more_than_half_degree(self):
+        cd = {"market_type": "range", "low": 30, "high": 31}
+        assert _outcome_yes(29.4, cd) == 0
 
     def test_range_no_when_tmax_above_high(self):
         cd = {"market_type": "range", "low": 30, "high": 31}

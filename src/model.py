@@ -613,53 +613,6 @@ class GBResidualModel(_BaseTempModel):
         return np.maximum(pred_scale * (1.0 + SPREAD_ALPHA * spread), 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Legacy: TempDistributionModel (Ridge, no epistemic)
-# ---------------------------------------------------------------------------
-
-class TempDistributionModel:
-    """
-    Ridge regression point forecast + Gaussian residual uncertainty.
-    Kept for backward compatibility. Prefer BayesianTempModel for new code.
-    """
-
-    def __init__(self, alpha: float = RIDGE_ALPHA):
-        self.model = Ridge(alpha=alpha)
-        self.sigma_: float = None
-        self.is_fit: bool = False
-
-    def fit(self, df: pd.DataFrame) -> "TempDistributionModel":
-        train = df.dropna(subset=FEATURES + ["y_tmax"]).copy()
-        if train.empty:
-            raise ValueError("No complete rows to train on after dropping NaNs.")
-        X = train[FEATURES].values
-        y = train["y_tmax"].values
-        self.model.fit(X, y)
-        self.sigma_ = float((y - self.model.predict(X)).std(ddof=1))
-        self.is_fit = True
-        return self
-
-    def predict_mean(self, df: pd.DataFrame) -> np.ndarray:
-        if not self.is_fit:
-            raise RuntimeError("Model not fit. Call fit() first.")
-        return self.model.predict(df[FEATURES].values)
-
-    def predict_integer_probs(self, df, temp_grid=None):
-        if temp_grid is None:
-            temp_grid = range(TEMP_GRID_MIN, TEMP_GRID_MAX + 1)
-        mu = self.predict_mean(df)
-        base_sigma = max(self.sigma_, 1.0)
-        spread_vals = df["ensemble_spread"].fillna(0).values if "ensemble_spread" in df.columns else np.zeros(len(mu))
-        rows = []
-        for i, m in enumerate(mu):
-            sigma = max(base_sigma * (1.0 + SPREAD_ALPHA * float(spread_vals[i])), 1.0)
-            probs = [norm.cdf(k + 0.5, loc=m, scale=sigma) - norm.cdf(k - 0.5, loc=m, scale=sigma) for k in temp_grid]
-            t = sum(probs)
-            row = {"row_id": i}
-            row.update({f"temp_{k}": p / t for k, p in zip(temp_grid, probs)})
-            rows.append(row)
-        return pd.DataFrame(rows)
-
 
 # ---------------------------------------------------------------------------
 # Calibrator

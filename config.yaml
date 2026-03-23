@@ -23,6 +23,7 @@ live:
   max_daily_trades: 100           # max buy orders per calendar day (matches mega_tune)
   kalshi_rate_sleep: 0.5          # seconds between Kalshi API calls
   target_date_cutoff_hour: 16     # before this hour trade same-day; after, trade tomorrow
+  blocked_cities: ["Austin"]      # cities to completely skip for new entries
 
 # ── Temperature model ─────────────────────────────────────────────────────────
 model:

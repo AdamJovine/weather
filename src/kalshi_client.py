@@ -210,6 +210,11 @@ class KalshiWeatherClient:
         action: str = "buy",
         order_type: str = "limit",
         client_order_id: Optional[str] = None,
+        post_only: Optional[bool] = None,
+        time_in_force: Optional[str] = None,
+        buy_max_cost: Optional[int] = None,
+        reduce_only: Optional[bool] = None,
+        cancel_order_on_pause: Optional[bool] = None,
     ) -> dict:
         """
         Place a limit order on Kalshi.
@@ -232,6 +237,53 @@ class KalshiWeatherClient:
             kwargs["no_price"] = price
         if client_order_id:
             kwargs["client_order_id"] = client_order_id
+        if post_only is not None:
+            kwargs["post_only"] = bool(post_only)
+        if time_in_force is not None:
+            kwargs["time_in_force"] = str(time_in_force)
+        if buy_max_cost is not None:
+            kwargs["buy_max_cost"] = int(buy_max_cost)
+        if reduce_only is not None:
+            kwargs["reduce_only"] = bool(reduce_only)
+        if cancel_order_on_pause is not None:
+            kwargs["cancel_order_on_pause"] = bool(cancel_order_on_pause)
 
         resp = self._client._orders_api.create_order(**kwargs)
+        return resp if isinstance(resp, dict) else resp.to_dict()
+
+    def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+    ) -> dict:
+        """
+        Return current/past orders from portfolio order endpoint.
+
+        status examples: "resting", "executed", "canceled"
+        """
+        kwargs = {"limit": int(limit)}
+        if ticker:
+            kwargs["ticker"] = ticker
+        if event_ticker:
+            kwargs["event_ticker"] = event_ticker
+        if status:
+            kwargs["status"] = status
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = self._client._orders_api.get_orders(**kwargs)
+        data = resp if isinstance(resp, dict) else resp.to_dict()
+        data["orders"] = [
+            o if isinstance(o, dict) else o.to_dict()
+            for o in data.get("orders", []) or []
+        ]
+        return data
+
+    def cancel_order(self, order_id: str) -> dict:
+        """
+        Cancel an existing order by id.
+        """
+        resp = self._client._orders_api.cancel_order(order_id)
         return resp if isinstance(resp, dict) else resp.to_dict()

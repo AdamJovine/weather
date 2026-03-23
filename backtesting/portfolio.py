@@ -27,7 +27,7 @@ class OpenPosition:
     city: str
     ticker: str
     title: str
-    contract_type: str      # "geq" | "leq" | "range"
+    contract_type: str      # "gt" | "lt" | "geq" | "leq" | "range"
     threshold: int          # geq/leq threshold; low bound for range
     contract_def: dict      # raw dict from parse_contract()
     side: str               # "yes" | "no"
@@ -56,7 +56,7 @@ class Trade:
     session_ts: int         # real candle timestamp (Unix s UTC); 0 if unavailable
     ticker: str             # Kalshi market ticker, e.g. KXHIGHNYC-26MAR17-T59
     title: str              # human-readable market title
-    contract_type: str      # "geq" | "leq" | "range"
+    contract_type: str      # "gt" | "lt" | "geq" | "leq" | "range"
     threshold: int          # threshold for geq/leq; low bound for range
     side: str               # "yes" | "no"
     mkt_p: float            # real Kalshi close_dollars at entry (or exit price for exit trades)

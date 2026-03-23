@@ -319,32 +319,43 @@ def _fetch_city_hourly_extras(
     Returns None on any failure.
     """
     import requests as _req
-    try:
-        r = _req.get(
-            OPENMETEO_FORECAST_URL,
-            params={
-                "latitude":         lat,
-                "longitude":        lon,
-                "start_date":       start,
-                "end_date":         end,
-                "hourly":           ["temperature_850hpa", "dew_point_2m"],
-                "temperature_unit": "fahrenheit",
-                "timezone":         timezone,
-                "models":           "gfs_seamless",
-                "format":           "json",
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        hourly = r.json().get("hourly", {})
-        if not hourly or "time" not in hourly:
-            return None
-    except Exception:
+    # Try the regular forecast API first (supports 850hPa for recent/future dates),
+    # then fall back to the historical forecast API.
+    _URLS = [
+        "https://api.open-meteo.com/v1/forecast",
+        OPENMETEO_FORECAST_URL,
+    ]
+    hourly = None
+    for url in _URLS:
+        try:
+            r = _req.get(
+                url,
+                params={
+                    "latitude":         lat,
+                    "longitude":        lon,
+                    "start_date":       start,
+                    "end_date":         end,
+                    "hourly":           ["temperature_850hPa", "dew_point_2m"],
+                    "temperature_unit": "fahrenheit",
+                    "timezone":         timezone,
+                    "models":           "gfs_seamless",
+                    "format":           "json",
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            hourly = r.json().get("hourly", {})
+            if hourly and "time" in hourly:
+                break
+            hourly = None
+        except Exception:
+            continue
+    if not hourly or "time" not in hourly:
         return None
 
     df_h = pd.DataFrame({
         "datetime":        pd.to_datetime(hourly["time"]),
-        "temperature_850": np.array(hourly.get("temperature_850hpa", []), dtype=float),
+        "temperature_850": np.array(hourly.get("temperature_850hPa", hourly.get("temperature_850hpa", [])), dtype=float),
         "dew_point":       np.array(hourly.get("dew_point_2m", []),       dtype=float),
     })
     df_h["date"] = df_h["datetime"].dt.date
@@ -455,6 +466,56 @@ def fetch_obs_actuals(
         "date":    pd.to_datetime(times).date,
         "city":    city,
         "station": "openmeteo_era5",
+        "tmax":    np.round(np.array(tmax_vals, dtype=float), 1),
+    })
+    return df.dropna(subset=["tmax"])
+
+
+def fetch_recent_actuals(
+    city: str, lat: float, lon: float, timezone: str, start: str, end: str
+) -> pd.DataFrame:
+    """
+    Fetch daily TMAX from the OpenMeteo *forecast* API for recent days.
+
+    The forecast API provides analyzed/observed temperatures for the last
+    ~5 days via the ``past_days`` mechanism, with only ~1-day lag — much
+    fresher than ERA5 (~5-day lag).  This fills the gap between ERA5 and
+    yesterday in weather_daily.
+
+    Returns columns: date, city, station, tmax (°F).
+    Only rows with non-null tmax are returned.
+    """
+    import requests as _req
+    resp = _req.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude":         lat,
+            "longitude":        lon,
+            "start_date":       start,
+            "end_date":         end,
+            "daily":            "temperature_2m_max",
+            "temperature_unit": "fahrenheit",
+            "timezone":         timezone,
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise ValueError(
+            f"OpenMeteo forecast error {resp.status_code}: "
+            f"{resp.json().get('reason', resp.text)}"
+        )
+
+    daily = resp.json().get("daily", {})
+    times     = daily.get("time", [])
+    tmax_vals = daily.get("temperature_2m_max", [])
+
+    if not times or not tmax_vals:
+        return pd.DataFrame(columns=["date", "city", "station", "tmax"])
+
+    df = pd.DataFrame({
+        "date":    pd.to_datetime(times).date,
+        "city":    city,
+        "station": "openmeteo_forecast",
         "tmax":    np.round(np.array(tmax_vals, dtype=float), 1),
     })
     return df.dropna(subset=["tmax"])

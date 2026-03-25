@@ -2,7 +2,7 @@
 Kalshi price fetcher for high-temperature markets across all cities.
 
 Polls all open KXHIGH* contracts and records bid/ask/volume snapshots.
-Auth uses RSA key-pair via env vars KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH.
+Auth uses RSA key-pair via env vars KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pandas as pd
 
@@ -23,7 +22,7 @@ KALSHI_BASE_URL = os.getenv(
     "https://api.elections.kalshi.com/trade-api/v2",
 )
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY")
 
 # All KXHIGH* series from station config
 SERIES_TICKERS = sorted({s.kalshi_series for s in STATIONS})
@@ -35,13 +34,12 @@ def _get_client():
 
     if not KALSHI_API_KEY_ID:
         raise RuntimeError("KALSHI_API_KEY_ID not set")
-    key_path = Path(KALSHI_PRIVATE_KEY_PATH or "")
-    if not key_path.exists():
-        raise RuntimeError(f"Kalshi private key not found: {key_path}")
+    if not KALSHI_PRIVATE_KEY:
+        raise RuntimeError("KALSHI_PRIVATE_KEY not set")
 
     config = Configuration(host=KALSHI_BASE_URL)
     client = KalshiClient(configuration=config)
-    client.kalshi_auth = KalshiAuth(KALSHI_API_KEY_ID, key_path.read_text())
+    client.kalshi_auth = KalshiAuth(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
     return client
 
 

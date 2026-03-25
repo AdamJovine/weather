@@ -1,14 +1,14 @@
+# Secrets
+.env
+
 # Database
-data/*.db
+*.db
 
 # Logs - generated output
-logs/*.csv
-logs/*.png
-logs/*.json
-logs/mega_tune/
-logs/backtest/
-logs/forecast_backtest/
-logs/runs/
+logs/
+
+# Old project archive
+old/
 
 # Cache
 .cache/
@@ -16,7 +16,6 @@ logs/runs/
 # Python
 __pycache__/
 *.pyc
-*.pyo
 *.pyo
 .pytest_cache/
 

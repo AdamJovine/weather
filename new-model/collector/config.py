@@ -22,8 +22,8 @@ class Station:
     kalshi_series: str
 
 
-# Load stations from the canonical CSV (old/data/stations.csv)
-_STATIONS_CSV = Path(__file__).resolve().parents[2] / "old" / "data" / "stations.csv"
+# Load stations from the canonical CSV (new-model/data/stations.csv)
+_STATIONS_CSV = Path(__file__).resolve().parents[1] / "data" / "stations.csv"
 
 
 def _load_stations() -> list[Station]:

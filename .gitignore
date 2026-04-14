@@ -26,3 +26,7 @@ env/
 
 # macOS
 .DS_Store
+new-model/data/state_*.json
+new-model/data/trader_state.json
+new-model/data/trades*.log
+new-model/data/*.png

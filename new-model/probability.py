@@ -1,14 +1,17 @@
 """
-Backtest: empirical lead-time-matched pricing from iem_forecasts only.
+Backtest: empirical pricing at fixed NBS runtimes (01Z, 07Z, 13Z, 19Z).
 
-1. Single pass: compute empirical fair value for every contract at every
-   NBS signal tick. Store all opportunities.
-2. Fast sweep: filter opportunities by (min_edge, max_cost) thresholds.
+Since error distributions are stable across lead times, we pool all
+runtimes per station into one error distribution. Trade only when a new
+NBS run arrives at one of the 4 bulk runtimes.
+
+NY and PHL errors are correlated (r=0.65) — shared position limit.
+
+Sweeps: min_edge, max_cost, max_pos, and NE_combined_limit.
 
 Usage:
     cd new-model
-    python probability.py                        # full sweep
-    python probability.py --edge 15 --cost 30    # specific params
+    python probability.py
 """
 
 from __future__ import annotations
@@ -34,8 +37,8 @@ ICAO_TO_CITY = {s.icao: s.city for s in STATIONS}
 NBS_LAG = DISSEMINATION_LAG["NBS"]
 _TICKER_RE = re.compile(r"^(KXHIGH\w+)-(\d{2}[A-Z]{3}\d{2})-([TB])([\d.]+)$")
 
-ERROR_LOOKBACK = 180
-MAX_LEAD_MISMATCH_HOURS = 3
+# Correlated pair — shared position limit
+NE_PAIR = {"KJFK", "KPHL"}
 
 
 @dataclass
@@ -55,72 +58,53 @@ def parse_ticker(ticker):
     return Contract(ticker, series, td, ctype, float(val))
 
 
-def build_nbs_index(nbs_rows):
-    """Index NBS rows by ftime for fast lookup: {ftime: [(runtime_str, txn)]}"""
-    idx = defaultdict(list)
-    for rt_str, ft_str, txn in nbs_rows:
-        if txn is not None:
-            idx[ft_str].append((rt_str, txn))
-    return dict(idx)
+# ── Build pooled error distributions per station ────────────────────────
+
+def build_station_errors(conn, stations):
+    """
+    For each station, pool ALL NBS forecast errors across all runtimes.
+    Returns {station: [errors]}.
+    """
+    result = {}
+    for stn in stations:
+        obs = dict(conn.execute(
+            "SELECT date, max_tmpf FROM observed_highs WHERE station=?",
+            (stn,)).fetchall())
+        if not obs:
+            # Fallback to METAR
+            rows = conn.execute(
+                "SELECT date(obs_time), MAX(temp_f) FROM metar_obs "
+                "WHERE station=? AND temp_f IS NOT NULL "
+                "GROUP BY date(obs_time)", (stn,)).fetchall()
+            obs = {r[0]: r[1] for r in rows if r[1] is not None}
+
+        nbs = conn.execute(
+            "SELECT runtime, ftime, txn FROM iem_forecasts "
+            "WHERE model='NBS' AND station=? AND txn IS NOT NULL "
+            "AND substr(ftime,12,8)='00:00:00'",
+            (stn,)).fetchall()
+
+        # Group by target_date (ftime - 1 day)
+        by_target = defaultdict(list)
+        for rt, ft, txn in nbs:
+            target = (datetime.fromisoformat(ft.replace("Z", "+00:00"))
+                      - timedelta(days=1)).strftime("%Y-%m-%d")
+            by_target[target].append((rt, txn))
+
+        errors = []
+        for target, forecasts in by_target.items():
+            if target not in obs:
+                continue
+            actual = obs[target]
+            # Use the LATEST forecast for this target date
+            latest_rt, latest_txn = max(forecasts, key=lambda x: x[0])
+            errors.append(actual - latest_txn)
+
+        result[stn] = errors
+    return result
 
 
-def get_errors_at_lead(nbs_rows, metar_data, station, target_date,
-                       current_runtime, obs_highs=None, nbs_index=None):
-    td = datetime.strptime(target_date, "%Y-%m-%d")
-    target_ftime = (td + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
-    runtime_dt = datetime.fromisoformat(current_runtime.replace("Z", "+00:00"))
-    ftime_dt = datetime.fromisoformat(target_ftime.replace("Z", "+00:00"))
-    lead = ftime_dt - runtime_dt
-
-    # Build index if not provided
-    if nbs_index is None:
-        nbs_index = build_nbs_index(nbs_rows)
-
-    errors = []
-    for days_back in range(1, ERROR_LOOKBACK + 30):
-        if len(errors) >= ERROR_LOOKBACK:
-            break
-        past_date = (td - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        past_next = (td - timedelta(days=days_back - 1)).strftime("%Y-%m-%d")
-        past_ftime = past_next + "T00:00:00Z"
-        ideal_rt = (datetime.fromisoformat(
-            past_ftime.replace("Z", "+00:00")) - lead)
-
-        # Fast lookup by ftime
-        candidates = nbs_index.get(past_ftime)
-        if not candidates:
-            continue
-
-        best_txn = None
-        best_diff = float("inf")
-        for rt_str, txn in candidates:
-            rt_dt = datetime.fromisoformat(rt_str.replace("Z", "+00:00"))
-            diff = abs((rt_dt - ideal_rt).total_seconds())
-            if diff < best_diff:
-                best_diff = diff
-                best_txn = txn
-
-        if best_txn is None or best_diff > MAX_LEAD_MISMATCH_HOURS * 3600:
-            continue
-
-        obs_val = None
-        if obs_highs:
-            obs_val = obs_highs.get((station, past_date))
-        if obs_val is None:
-            obs_temps = metar_data.get(station)
-            if obs_temps:
-                day_temps = [t for ot, t in obs_temps
-                             if ot >= past_date + "T00:00:00Z"
-                             and ot < past_next + "T00:00:00Z"
-                             and t is not None]
-                if day_temps:
-                    obs_val = max(day_temps)
-        if obs_val is None:
-            continue
-
-        errors.append(obs_val - best_txn)
-    return errors
-
+# ── Empirical pricing ───────────────────────────────────────────────────
 
 def price_empirical(c, forecast, errors, t_low):
     if not errors: return None
@@ -147,10 +131,12 @@ def settle(c, obs_max, t_low):
         return 100 if x <= obs_max <= x + 1 else 0
 
 
-def run(fixed_edge=None, fixed_cost=None, max_pos=5):
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def run():
     conn = sqlite3.connect(str(DATA_DB))
 
-    # Parse
+    # Parse contracts
     all_tickers = [r[0] for r in conn.execute(
         "SELECT DISTINCT ticker FROM kalshi_prices").fetchall()]
     contracts = {}; groups = defaultdict(list)
@@ -169,48 +155,44 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
     # Preload
     print("Loading data...")
     ph = ",".join("?" * len(active))
+
+    # Build pooled error distributions
+    stn_errors = build_station_errors(conn, active)
+    for stn in active:
+        n = len(stn_errors.get(stn, []))
+        print(f"  {ICAO_TO_CITY.get(stn, stn):>15}: {n} errors")
+
+    # NBS data for signal detection and forecasts
     nbs_raw = conn.execute(
         f"SELECT station, runtime, ftime, txn FROM iem_forecasts "
         f"WHERE model='NBS' AND station IN ({ph}) "
-        f"ORDER BY station, runtime",
-        active).fetchall()
+        f"ORDER BY station, runtime", active).fetchall()
     nbs_by_stn = defaultdict(list)
     for stn, rt, ft, txn in nbs_raw:
         nbs_by_stn[stn].append((rt, ft, txn))
 
-    # Precompute ftime index per station for fast error lookups
-    nbs_idx = {stn: build_nbs_index(rows)
-               for stn, rows in nbs_by_stn.items()}
+    # Index by (station, ftime) for fast forecast lookup
+    nbs_idx = defaultdict(dict)  # {(stn, ftime): {runtime: txn}}
+    for stn, rt, ft, txn in nbs_raw:
+        if txn is not None:
+            nbs_idx[(stn, ft)][rt] = txn
 
+    # Settlement data
+    obs_lookup = {}
+    try:
+        for stn, d, t in conn.execute(
+                f"SELECT station, date, max_tmpf FROM observed_highs "
+                f"WHERE station IN ({ph})", active).fetchall():
+            if t is not None: obs_lookup[(stn, d)] = t
+    except sqlite3.OperationalError:
+        pass
     metar_raw = conn.execute(
         f"SELECT station, obs_time, temp_f FROM metar_obs "
         f"WHERE station IN ({ph})", active).fetchall()
-    metar_data = defaultdict(list)
     for stn, ot, tf in metar_raw:
-        metar_data[stn].append((ot, tf))
-
-    # Load observed_highs (has 6 months of history)
-    obs_highs = {}
-    try:
-        oh_raw = conn.execute(
-            f"SELECT station, date, max_tmpf FROM observed_highs "
-            f"WHERE station IN ({ph})", active).fetchall()
-        for stn, d, t in oh_raw:
-            if t is not None:
-                obs_highs[(stn, d)] = t
-        print(f"  {len(obs_highs)} observed highs loaded")
-    except sqlite3.OperationalError:
-        pass
-
-    # Settlement lookup: observed_highs first, then METAR
-    obs_lookup = dict(obs_highs)
-    for stn in active:
-        by_day = defaultdict(list)
-        for ot, tf in metar_data.get(stn, []):
-            if tf is not None: by_day[ot[:10]].append(tf)
-        for d, tl in by_day.items():
-            if (stn, d) not in obs_lookup:
-                obs_lookup[(stn, d)] = max(tl)
+        if tf is not None:
+            key = (stn, ot[:10])
+            obs_lookup[key] = max(obs_lookup.get(key, -999), tf)
 
     snapshots = [r[0] for r in conn.execute(
         "SELECT DISTINCT ts FROM kalshi_prices ORDER BY ts").fetchall()]
@@ -225,14 +207,16 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
     print(f"  Eval: {sorted(eval_dates)}")
 
     # ── SINGLE PASS: compute all opportunities ──────────────────────────
-    print(f"\nComputing empirical fair values (single pass)...")
+    print(f"\nComputing opportunities...")
     prev_nbs_rt = {}
-    opps = []  # all tradeable opportunities
+    opps = []
 
     for si, ts in enumerate(snapshots):
         as_of = pd.Timestamp(ts)
         cutoff_str = (as_of - NBS_LAG).strftime("%Y-%m-%dT%H:%M:%SZ")
+        today = ts[:10]
 
+        # Detect new NBS runs
         signal_stations = set()
         for stn in active:
             rows = nbs_by_stn.get(stn)
@@ -255,28 +239,26 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
             continue
 
         for (series, td), grp in groups.items():
+            if td <= today:
+                continue
             icao = SERIES_TO_ICAO.get(series)
             if not icao or icao not in signal_stations:
                 continue
 
-            runtime = prev_nbs_rt[icao]
+            # Get latest NBS forecast
             td_dt = datetime.strptime(td, "%Y-%m-%d")
             next_00z = (td_dt + timedelta(days=1)).strftime(
                 "%Y-%m-%dT00:00:00Z")
-            forecast = None
-            for rt_str, ft_str, txn in reversed(nbs_by_stn.get(icao, [])):
-                if ft_str == next_00z and txn is not None and rt_str <= cutoff_str:
-                    forecast = txn
-                    runtime = rt_str
-                    break
-            if forecast is None:
+            runtimes = nbs_idx.get((icao, next_00z), {})
+            valid_rts = {rt: txn for rt, txn in runtimes.items()
+                         if rt <= cutoff_str}
+            if not valid_rts:
                 continue
+            best_rt = max(valid_rts.keys())
+            forecast = valid_rts[best_rt]
 
-            errors = get_errors_at_lead(
-                nbs_by_stn[icao], metar_data, icao, td, runtime,
-                obs_highs=obs_highs,
-                nbs_index=nbs_idx.get(icao))
-            if not errors:
+            errors = stn_errors.get(icao, [])
+            if len(errors) < 30:
                 continue
 
             t_low = bounds[(series, td)]
@@ -299,220 +281,192 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
                 opps.append({
                     "ts": ts, "ticker": c.ticker,
                     "city": SERIES_TO_CITY.get(series, series),
+                    "station": icao,
                     "target_date": td,
-                    "side_buy": "BUY", "side_sell": "SELL",
                     "bid": bid, "ask": ask, "fv": fv,
-                    "edge_buy": fv - ask,    # positive = YES underpriced
-                    "edge_sell": bid - fv,   # positive = YES overpriced
+                    "edge_buy": fv - ask,
+                    "edge_sell": bid - fv,
                     "cost_buy": ask,
                     "cost_sell": 100 - bid,
-                    "forecast": forecast, "n_errors": len(errors),
+                    "forecast": forecast,
                     "settlement": stl,
                     "is_eval": td in eval_dates,
                 })
 
-        if (si + 1) % 500 == 0:
+        if (si + 1) % 1000 == 0:
             print(f"  {si+1}/{len(snapshots)} ticks, "
                   f"{len(opps)} opportunities")
 
-    print(f"  Done: {len(opps)} opportunities from "
-          f"{len(snapshots)} snapshots\n")
-
+    print(f"  Done: {len(opps)} opportunities\n")
     odf = pd.DataFrame(opps)
     if odf.empty:
-        print("No opportunities found.")
-        return
+        print("No opportunities."); return
 
-    # ── FAST SWEEP ──────────────────────────────────────────────────────
-    if fixed_edge is not None and fixed_cost is not None:
-        edges = [fixed_edge]
-        costs = [fixed_cost]
-    else:
-        edges = [5, 8, 10, 15, 20, 25, 30, 40]
-        costs = [10, 15, 20, 25, 30, 40, 50]
+    # ── SWEEP ────────────────────────────────────────────────────────────
+    edges = [5, 8, 10, 15, 20, 25, 30]
+    costs = [5, 8, 10, 15, 20, 25, 30]
+    positions = [3, 5, 10]
+    ne_limits = [3, 5, 8, 10]  # combined NY+PHL limit
 
-    def sweep_one(min_edge, max_cost):
-        pos = defaultdict(int)
-        total_pnl = 0; total_cap = 0; n_set = 0; n_wins = 0
-        pnl_tr = 0; pnl_ev = 0; cap_tr = 0; cap_ev = 0
-        n_tr = 0; n_ev = 0; n_buys = 0; n_sells = 0
+    print(f"{'=' * 100}")
+    print(f"  HYPERPARAMETER SEARCH")
+    print(f"  Params: min_edge x max_cost x max_pos x ne_limit")
+    print(f"  NY-PHL correlated (r=0.65) — shared NE position limit")
+    print(f"{'=' * 100}")
 
-        for _, o in odf.iterrows():
-            tk = o["ticker"]
-            # BUY YES
-            if (o["edge_buy"] >= min_edge and o["cost_buy"] <= max_cost
-                    and pos[tk] < max_pos):
-                pos[tk] += 1
-                cost = o["cost_buy"]
-                stl = o["settlement"]
-                if pd.notna(stl):
-                    pnl = stl - o["ask"]
-                    total_pnl += pnl; total_cap += cost; n_set += 1
-                    if pnl > 0: n_wins += 1
-                    if o["is_eval"]:
-                        pnl_ev += pnl; cap_ev += cost; n_ev += 1
-                    else:
-                        pnl_tr += pnl; cap_tr += cost; n_tr += 1
-                n_buys += 1
-            # BUY NO
-            elif (o["edge_sell"] >= min_edge
-                  and o["cost_sell"] <= max_cost
-                  and pos[tk] > -max_pos):
-                pos[tk] -= 1
-                cost = o["cost_sell"]
-                stl = o["settlement"]
-                if pd.notna(stl):
-                    pnl = o["bid"] - stl
-                    total_pnl += pnl; total_cap += cost; n_set += 1
-                    if pnl > 0: n_wins += 1
-                    if o["is_eval"]:
-                        pnl_ev += pnl; cap_ev += cost; n_ev += 1
-                    else:
-                        pnl_tr += pnl; cap_tr += cost; n_tr += 1
-                n_sells += 1
+    best_pnl = -9999
+    best_params = {}
+    all_results = []
 
-        fills = n_buys + n_sells
-        return {
-            "fills": fills, "settled": n_set,
-            "pnl": total_pnl, "cap": total_cap,
-            "roi": total_pnl / total_cap * 100 if total_cap > 0 else 0,
-            "win": n_wins / n_set * 100 if n_set > 0 else 0,
-            "pnl_tr": pnl_tr, "cap_tr": cap_tr, "n_tr": n_tr,
-            "roi_tr": pnl_tr / cap_tr * 100 if cap_tr > 0 else 0,
-            "pnl_ev": pnl_ev, "cap_ev": cap_ev, "n_ev": n_ev,
-            "roi_ev": pnl_ev / cap_ev * 100 if cap_ev > 0 else 0,
-            "buys": n_buys, "sells": n_sells,
-        }
+    for max_pos in positions:
+        for ne_limit in ne_limits:
+            if ne_limit > max_pos * 2:
+                continue
+            for min_edge in edges:
+                for max_cost in costs:
+                    pos = defaultdict(int)
+                    total_pnl = 0; total_cap = 0
+                    n_set = 0; n_wins = 0
+                    pnl_tr = 0; pnl_ev = 0
+                    cap_tr = 0; cap_ev = 0
+                    n_tr = 0; n_ev = 0
 
-    print(f"{'=' * 130}")
-    print(f"  PARAMETER SWEEP  (empirical lead-matched pricing)")
-    print(f"{'=' * 130}")
+                    for _, o in odf.iterrows():
+                        tk = o["ticker"]
+                        stn = o["station"]
+                        stl = o["settlement"]
 
-    grid = {}
-    best_pnl = -9999; best = (10, 30)
+                        # NE combined limit
+                        ne_pos = sum(abs(pos[k]) for k in pos
+                                     if any(s in k for s in NE_PAIR))
 
-    # PnL grid
-    print(f"\n  TOTAL PnL / fills / ROI:")
-    print(f"  {'':>10}", end="")
-    for c in costs:
-        print(f"  {'cost<='+str(c)+'c':>17}", end="")
-    print()
+                        did_trade = False
 
-    for e in edges:
-        print(f"  edge>={e:>2}c", end="")
-        for c in costs:
-            r = sweep_one(e, c)
-            grid[(e, c)] = r
-            if r["pnl"] > best_pnl and r["settled"] >= 5:
-                best_pnl = r["pnl"]; best = (e, c)
-            if r["settled"] > 0:
-                print(f"  {r['pnl']:>+5.0f}c {r['settled']:>3}f"
-                      f" {r['roi']:>+4.0f}%", end="")
-            else:
-                print(f"     {'--':>5} {r['settled']:>3}f"
-                      f"     ", end="")
-        print()
+                        if (o["edge_buy"] >= min_edge
+                                and o["cost_buy"] <= max_cost
+                                and pos[tk] < max_pos):
+                            if stn in NE_PAIR and ne_pos >= ne_limit:
+                                pass
+                            else:
+                                pos[tk] += 1
+                                did_trade = True
+                                if pd.notna(stl):
+                                    pnl = stl - o["ask"]
+                                    total_pnl += pnl
+                                    total_cap += o["cost_buy"]
+                                    n_set += 1
+                                    if pnl > 0: n_wins += 1
+                                    if o["is_eval"]:
+                                        pnl_ev += pnl; cap_ev += o["cost_buy"]; n_ev += 1
+                                    else:
+                                        pnl_tr += pnl; cap_tr += o["cost_buy"]; n_tr += 1
 
-    # Eval grid
-    print(f"\n  EVAL-ONLY PnL:")
-    print(f"  {'':>10}", end="")
-    for c in costs:
-        print(f"  {'cost<='+str(c)+'c':>17}", end="")
-    print()
+                        if not did_trade and (o["edge_sell"] >= min_edge
+                                and o["cost_sell"] <= max_cost
+                                and pos[tk] > -max_pos):
+                            if stn in NE_PAIR and ne_pos >= ne_limit:
+                                pass
+                            else:
+                                pos[tk] -= 1
+                                if pd.notna(stl):
+                                    pnl = o["bid"] - stl
+                                    total_pnl += pnl
+                                    total_cap += o["cost_sell"]
+                                    n_set += 1
+                                    if pnl > 0: n_wins += 1
+                                    if o["is_eval"]:
+                                        pnl_ev += pnl; cap_ev += o["cost_sell"]; n_ev += 1
+                                    else:
+                                        pnl_tr += pnl; cap_tr += o["cost_sell"]; n_tr += 1
 
-    for e in edges:
-        print(f"  edge>={e:>2}c", end="")
-        for c in costs:
-            r = grid[(e, c)]
-            if r["n_ev"] > 0:
-                print(f"  {r['pnl_ev']:>+5.0f}c {r['n_ev']:>3}f"
-                      f" {r['roi_ev']:>+4.0f}%", end="")
-            else:
-                print(f"     {'--':>5} {r['n_ev']:>3}f"
-                      f"     ", end="")
-        print()
+                    if n_set < 5:
+                        continue
 
-    # Best detail
-    be, bc = best
-    r = sweep_one(be, bc)
+                    roi = total_pnl / total_cap * 100 if total_cap > 0 else 0
+                    roi_ev = pnl_ev / cap_ev * 100 if cap_ev > 0 else 0
 
-    print(f"\n{'=' * 130}")
-    print(f"  BEST: edge >= {be}c, cost <= {bc}c  "
-          f"(max PnL with >= 5 settled)")
-    print(f"{'=' * 130}")
-    print(f"  Fills:    {r['fills']} ({r['buys']} BUY YES / "
-          f"{r['sells']} BUY NO)")
-    print(f"  Settled:  {r['settled']}   Win: {r['win']:.0f}%")
-    print(f"  PnL:      {r['pnl']:+.0f}c (${r['pnl']/100:+,.2f})  "
-          f"Cap: {r['cap']:.0f}c  ROI: {r['roi']:+.1f}%")
-    if r["n_tr"]:
-        print(f"  TRAIN:    {r['pnl_tr']:+.0f}c  "
-              f"ROI: {r['roi_tr']:+.1f}%  ({r['n_tr']} fills)")
-    if r["n_ev"]:
-        print(f"  EVAL:     {r['pnl_ev']:+.0f}c  "
-              f"ROI: {r['roi_ev']:+.1f}%  ({r['n_ev']} fills)")
+                    r = {
+                        "edge": min_edge, "cost": max_cost,
+                        "max_pos": max_pos, "ne_limit": ne_limit,
+                        "pnl": total_pnl, "cap": total_cap,
+                        "roi": roi, "settled": n_set,
+                        "win": n_wins / n_set * 100 if n_set else 0,
+                        "pnl_tr": pnl_tr, "pnl_ev": pnl_ev,
+                        "roi_ev": roi_ev, "n_ev": n_ev,
+                    }
+                    all_results.append(r)
 
-    # Run best with trade detail
-    pos = defaultdict(int)
-    trade_detail = []
-    for _, o in odf.iterrows():
-        tk = o["ticker"]
-        if (o["edge_buy"] >= be and o["cost_buy"] <= bc and pos[tk] < max_pos):
-            pos[tk] += 1
-            if pd.notna(o["settlement"]):
-                pnl = o["settlement"] - o["ask"]
-                trade_detail.append({**o, "side": "BUY", "cost": o["cost_buy"],
-                                     "edge": o["edge_buy"], "pnl": pnl})
-        elif (o["edge_sell"] >= be and o["cost_sell"] <= bc and pos[tk] > -max_pos):
-            pos[tk] -= 1
-            if pd.notna(o["settlement"]):
-                pnl = o["bid"] - o["settlement"]
-                trade_detail.append({**o, "side": "SELL", "cost": o["cost_sell"],
-                                     "edge": o["edge_sell"], "pnl": pnl})
+                    if total_pnl > best_pnl:
+                        best_pnl = total_pnl
+                        best_params = r
 
-    if trade_detail:
-        tpdf = pd.DataFrame(trade_detail)
+    rdf = pd.DataFrame(all_results)
 
-        for side, lbl in [("BUY", "BUY YES"), ("SELL", "BUY NO")]:
-            s = tpdf[tpdf["side"] == side]
-            if s.empty: continue
-            print(f"\n  {lbl}: {len(s)} fills  "
-                  f"PnL={s['pnl'].sum():+.0f}c  "
-                  f"ROI={s['pnl'].sum()/s['cost'].sum()*100:+.0f}%  "
-                  f"win={(s['pnl']>0).sum()}/{len(s)}")
+    # Show top 20 by total PnL
+    top_pnl = rdf.nlargest(20, "pnl")
+    print(f"\n  TOP 20 BY TOTAL PnL:")
+    print(f"  {'Edge':>5} {'Cost':>5} {'Pos':>4} {'NE':>3} "
+          f"{'Fills':>6} {'PnL':>8} {'ROI':>6} {'Win%':>5} "
+          f"{'EvPnL':>7} {'EvROI':>6} {'EvN':>4}")
+    print(f"  {'-' * 70}")
+    for _, r in top_pnl.iterrows():
+        print(f"  {r['edge']:>4.0f}c {r['cost']:>4.0f}c "
+              f"{r['max_pos']:>4.0f} {r['ne_limit']:>3.0f} "
+              f"{r['settled']:>6.0f} {r['pnl']:>+7.0f}c "
+              f"{r['roi']:>+5.0f}% {r['win']:>4.0f}% "
+              f"{r['pnl_ev']:>+6.0f}c {r['roi_ev']:>+5.0f}% "
+              f"{r['n_ev']:>4.0f}")
 
-        city_s = (tpdf.groupby("city").agg(
-            f=("pnl","count"), p=("pnl","sum"), c=("cost","sum"))
-            .sort_values("p", ascending=False))
-        city_s["roi"] = city_s["p"] / city_s["c"] * 100
-        print(f"\n  {'City':<15} {'Fills':>6} {'PnL':>8} {'ROI':>8}")
-        print(f"  {'-' * 42}")
-        for city, row in city_s.iterrows():
-            print(f"  {city:<15} {int(row['f']):>6} "
-                  f"{row['p']:>+7.0f}c {row['roi']:>+7.0f}%")
+    # Show top 20 by eval PnL (out-of-sample)
+    eval_results = rdf[rdf["n_ev"] >= 3]
+    if not eval_results.empty:
+        top_ev = eval_results.nlargest(20, "pnl_ev")
+        print(f"\n  TOP 20 BY EVAL PnL (out-of-sample):")
+        print(f"  {'Edge':>5} {'Cost':>5} {'Pos':>4} {'NE':>3} "
+              f"{'Fills':>6} {'PnL':>8} {'ROI':>6} {'Win%':>5} "
+              f"{'EvPnL':>7} {'EvROI':>6} {'EvN':>4}")
+        print(f"  {'-' * 70}")
+        for _, r in top_ev.iterrows():
+            print(f"  {r['edge']:>4.0f}c {r['cost']:>4.0f}c "
+                  f"{r['max_pos']:>4.0f} {r['ne_limit']:>3.0f} "
+                  f"{r['settled']:>6.0f} {r['pnl']:>+7.0f}c "
+                  f"{r['roi']:>+5.0f}% {r['win']:>4.0f}% "
+                  f"{r['pnl_ev']:>+6.0f}c {r['roi_ev']:>+5.0f}% "
+                  f"{r['n_ev']:>4.0f}")
 
-        print(f"\n  ALL TRADES ({len(tpdf)}):")
-        print(f"  {'Time':<9} {'Ticker':<28} {'Side':<5} "
-              f"{'Cost':>5} {'FV':>5} {'Edge':>5} {'Fcst':>5} "
-              f"{'Obs':>5} {'PnL':>6} {'N':>3}")
-        print(f"  {'-' * 100}")
-        for _, t in tpdf.sort_values("ts").iterrows():
-            obs_v = t["settlement"]  # actually this is stl value
-            obs_str = "YES" if obs_v == 100 else " NO"
-            print(f"  {t['ts'][11:19]:<9} {t['ticker']:<28} "
-                  f"{t['side']:<5} {t['cost']:>4}c "
-                  f"{t['fv']:>4.0f}c {t['edge']:>+4.0f}c "
-                  f"{t['forecast']:>5.0f} {obs_str:>5} "
-                  f"{t['pnl']:>+5.0f}c {t['n_errors']:>3}")
+    # Best balanced: top eval PnL with train PnL > 0
+    balanced = rdf[(rdf["pnl_tr"] > 0) & (rdf["n_ev"] >= 3)]
+    if not balanced.empty:
+        top_bal = balanced.nlargest(10, "pnl_ev")
+        print(f"\n  BEST BALANCED (train profitable + best eval):")
+        print(f"  {'Edge':>5} {'Cost':>5} {'Pos':>4} {'NE':>3} "
+              f"{'Fills':>6} {'TrPnL':>8} {'TrROI':>6} "
+              f"{'EvPnL':>7} {'EvROI':>6} {'EvN':>4}")
+        print(f"  {'-' * 70}")
+        for _, r in top_bal.iterrows():
+            tr_roi = r["pnl_tr"] / (r["cap"] - (r.get("cap_ev", 0) or 0)) * 100 if r["cap"] > 0 else 0
+            print(f"  {r['edge']:>4.0f}c {r['cost']:>4.0f}c "
+                  f"{r['max_pos']:>4.0f} {r['ne_limit']:>3.0f} "
+                  f"{r['settled']:>6.0f} {r['pnl_tr']:>+7.0f}c "
+                  f"{r['roi']:>+5.0f}% "
+                  f"{r['pnl_ev']:>+6.0f}c {r['roi_ev']:>+5.0f}% "
+                  f"{r['n_ev']:>4.0f}")
 
+    # Show the best params
+    bp = best_params
+    print(f"\n{'=' * 100}")
+    print(f"  BEST BY TOTAL PnL:")
+    print(f"  edge >= {bp['edge']}c, cost <= {bp['cost']}c, "
+          f"max_pos = {bp['max_pos']}, ne_limit = {bp['ne_limit']}")
+    print(f"  PnL = {bp['pnl']:+.0f}c (${bp['pnl']/100:+,.2f})  "
+          f"ROI = {bp['roi']:+.0f}%  Win = {bp['win']:.0f}%  "
+          f"Fills = {bp['settled']}")
+    print(f"  Eval: {bp['pnl_ev']:+.0f}c  ROI: {bp['roi_ev']:+.0f}%  "
+          f"N: {bp['n_ev']}")
+    print(f"{'=' * 100}")
     print()
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--edge", type=int, default=None)
-    p.add_argument("--cost", type=int, default=None)
-    p.add_argument("--max-pos", type=int, default=5)
-    args = p.parse_args()
     import logging; logging.basicConfig(level=logging.WARNING)
-    run(fixed_edge=args.edge, fixed_cost=args.cost, max_pos=args.max_pos)
+    run()

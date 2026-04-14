@@ -77,6 +77,24 @@ STRATEGIES = {
         "rise_window": 72,   # 72 ticks = 6h
         "desc": "BUY NO: edge>=5c, mid 20-35c, rose 2c+ in 6h",
     },
+    "buy-no-mid": {
+        "side": "NO",
+        "min_edge": 3,
+        "mid_lo": 20,
+        "mid_hi": 30,
+        "min_rise": 0,
+        "rise_window": 0,
+        "desc": "BUY NO: edge>=3c, mid 20-30c (forecast only)",
+    },
+    "buy-no-wide": {
+        "side": "NO",
+        "min_edge": 5,
+        "mid_lo": 20,
+        "mid_hi": 35,
+        "min_rise": 0,
+        "rise_window": 0,
+        "desc": "BUY NO: edge>=5c, mid 20-35c (forecast only)",
+    },
 }
 
 _TICKER_RE = re.compile(r"^(KXHIGH\w+)-(\d{2}[A-Z]{3}\d{2})-([TB])([\d.]+)$")
@@ -490,17 +508,20 @@ def run_once(client, state, strategy_name, log_file, dry_run=False):
                 if pos <= -MAX_POS:
                     continue
 
-                # Check price rise
-                current_mid, history = get_price_history(
-                    DB_PATH, c.ticker, strat["rise_window"])
-                if history is None or len(history) <= strat["rise_window"]:
-                    continue
-                old_mid = history[strat["rise_window"]][1]
-                if old_mid is None:
-                    continue
-                price_change = current_mid - old_mid
-                if price_change < strat["min_rise"]:
-                    continue
+                # Check price rise (skip if min_rise=0)
+                price_change = 0
+                if strat["min_rise"] > 0:
+                    current_mid, history = get_price_history(
+                        DB_PATH, c.ticker, strat["rise_window"])
+                    if (history is None
+                            or len(history) <= strat["rise_window"]):
+                        continue
+                    old_mid = history[strat["rise_window"]][1]
+                    if old_mid is None:
+                        continue
+                    price_change = current_mid - old_mid
+                    if price_change < strat["min_rise"]:
+                        continue
 
                 cost = no_cost
                 if state["capital_used"] + cost > MAX_CAPITAL:

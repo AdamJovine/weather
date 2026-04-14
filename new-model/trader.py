@@ -59,16 +59,27 @@ NBS_LAG = DISSEMINATION_LAG["NBS"]
 
 # Edge (cents) = |empirical_fv - market_price|
 # Cost = what you pay per contract (ask for YES, 100-bid for NO)
+# Edge thresholds are scaled per-station: stations with tighter forecast
+# distributions (lower std) need less edge to be confident.
+# Base edge is multiplied by (station_std / 3.0) so Miami (std=1.5)
+# gets half the edge requirement of the baseline.
 RULES = [
-    {"name": "R1", "min_edge": 10, "max_cost": 40},
-    {"name": "R2", "min_edge": 15, "max_cost": 30},
-    {"name": "R3", "min_edge": 20, "max_cost": 20},
-    {"name": "R4", "min_edge": 30, "max_cost": 15},
+    {"name": "R1", "base_edge": 10, "max_cost": 20},
+    {"name": "R2", "base_edge": 15, "max_cost": 15},
+    {"name": "R3", "base_edge": 20, "max_cost": 10},
+    {"name": "R4", "base_edge": 40, "max_cost": 15},
 ]
 
 MAX_CAPITAL = 10000  # cents = $100
 MAX_POS = 5
-ERROR_LOOKBACK_DAYS = 10
+ERROR_LOOKBACK_DAYS = 180
+
+# Per-station edge scaling: tighter forecast = lower edge needed
+# Based on 6-month std at 24h lead
+STATION_STD = {
+    "KMIA": 1.5, "KAUS": 2.5, "KJFK": 3.0,
+    "KDEN": 3.4, "KMDW": 3.5, "KPHL": 3.6,
+}
 MAX_LEAD_MISMATCH_HOURS = 3
 
 LOG_FILE = Path(__file__).resolve().parent / "data" / "trades.log"
@@ -121,7 +132,7 @@ def get_errors_at_lead(conn, station, target_date, current_runtime):
     lead_seconds = lead.total_seconds()
 
     errors = []
-    for days_back in range(1, ERROR_LOOKBACK_DAYS + 15):
+    for days_back in range(1, ERROR_LOOKBACK_DAYS + 30):
         if len(errors) >= ERROR_LOOKBACK_DAYS:
             break
 
@@ -165,19 +176,32 @@ def get_errors_at_lead(conn, station, target_date, current_runtime):
 
         forecast = float(best_row[1])
 
-        # Observed max from METAR
-        obs_row = conn.execute(
-            "SELECT MAX(temp_f) FROM metar_obs "
-            "WHERE station=? AND obs_time >= ? AND obs_time < ? "
-            "AND temp_f IS NOT NULL",
-            (station, past_date + "T00:00:00Z", past_next + "T00:00:00Z"),
-        ).fetchone()
-
-        if obs_row is None or obs_row[0] is None:
+        # Observed max: try observed_highs first, fall back to METAR
+        obs_val = None
+        try:
+            oh = conn.execute(
+                "SELECT max_tmpf FROM observed_highs "
+                "WHERE station=? AND date=?",
+                (station, past_date),
+            ).fetchone()
+            if oh and oh[0] is not None:
+                obs_val = float(oh[0])
+        except sqlite3.OperationalError:
+            pass
+        if obs_val is None:
+            mr = conn.execute(
+                "SELECT MAX(temp_f) FROM metar_obs "
+                "WHERE station=? AND obs_time >= ? AND obs_time < ? "
+                "AND temp_f IS NOT NULL",
+                (station, past_date + "T00:00:00Z",
+                 past_next + "T00:00:00Z"),
+            ).fetchone()
+            if mr and mr[0] is not None:
+                obs_val = float(mr[0])
+        if obs_val is None:
             continue
 
-        observed = float(obs_row[0])
-        errors.append(observed - forecast)
+        errors.append(obs_val - forecast)
 
     return errors
 
@@ -271,7 +295,11 @@ def place_order(client, ticker, side, count, price_cents, dry_run=False):
         resp = client._orders_api.create_order(**kwargs)
         return resp if isinstance(resp, dict) else resp.to_dict()
     except Exception as e:
-        log.error("ORDER FAILED %s: %s", ticker, e)
+        err_str = str(e)
+        if "409" in err_str:
+            log.warning("Order rejected (contract closed): %s", ticker)
+        else:
+            log.error("ORDER FAILED %s: %s", ticker, e)
         return None
 
 
@@ -500,21 +528,37 @@ def run_once(client, state, dry_run=False):
     print(f"\n  Error pools (past {ERROR_LOOKBACK_DAYS} days "
           f"at matched lead time):")
 
+    today = now.strftime("%Y-%m-%d")
+
     for (series, td), grp in sorted(groups.items()):
+        # Skip contracts settling today or earlier — they may already
+        # be closed and will return 409 Conflict
+        if td <= today:
+            continue
+
         icao = SERIES_TO_ICAO.get(series)
         city = SERIES_TO_CITY.get(series, series)
         if not icao or icao not in new_stations:
             continue
 
+        # Must have NBS forecast data for this station/date
         forecast, runtime = get_nbs_forecast_and_runtime(DB_PATH, icao, td)
         if forecast is None:
             continue
 
+        # Must have enough historical errors to price empirically
         errors = get_errors_at_lead(conn, icao, td, runtime)
-        print_error_pool(errors, icao, td, forecast, runtime)
-
         if not errors:
+            print(f"    {city} → {td}: SKIP — no error history "
+                  f"at this lead time")
             continue
+
+        if len(errors) < 10:
+            print(f"    {city} → {td}: SKIP — only {len(errors)} errors "
+                  f"(need >= 10)")
+            continue
+
+        print_error_pool(errors, icao, td, forecast, runtime)
 
         t_low = bounds[(series, td)]
 
@@ -539,7 +583,9 @@ def run_once(client, state, dry_run=False):
 
             for rule in RULES:
                 rname = rule["name"]
-                min_edge = rule["min_edge"]
+                # Scale edge by station accuracy
+                stn_std = STATION_STD.get(icao, 3.0)
+                min_edge = rule["base_edge"] * (stn_std / 3.0)
                 max_cost = rule["max_cost"]
                 pos_key = f"{rname}:{c.ticker}"
                 pos = state["positions"].get(pos_key, 0)
@@ -620,6 +666,8 @@ def main():
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Skip confirmation prompt for --live")
     parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args()
 
@@ -650,8 +698,10 @@ def main():
     print(f"  WEATHER TRADER — {env}{dry}")
     print(f"  Pricing: empirical errors from past {ERROR_LOOKBACK_DAYS} "
           f"days at matched lead time")
-    print(f"  Rules: R1(edge>=10,c<=40) R2(edge>=15,c<=30) "
-          f"R3(edge>=20,c<=20) R4(edge>=30,c<=15)")
+    print(f"  Rules: R1(edge>=10,c<=20) R2(edge>=15,c<=15) "
+          f"R3(edge>=20,c<=10) R4(edge>=40,c<=15)")
+    print(f"  Edge scaled by station accuracy "
+          f"(Miami=0.5x, Austin=0.8x, NY=1.0x, Denver=1.1x)")
     print(f"  Capital: ${MAX_CAPITAL/100:.0f} max  |  "
           f"Position: {MAX_POS} lots/contract")
     print(f"  Trigger: any new NBS/GFS/LAV run  |  "
@@ -659,7 +709,7 @@ def main():
     print(f"  Log: {LOG_FILE}")
     print(f"{'━' * 80}")
 
-    if args.live and not args.dry_run:
+    if args.live and not args.dry_run and not args.yes:
         print("\n  *** REAL MONEY ***")
         resp = input("  Type 'yes' to confirm: ")
         if resp.strip().lower() != "yes":

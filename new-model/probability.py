@@ -34,7 +34,7 @@ ICAO_TO_CITY = {s.icao: s.city for s in STATIONS}
 NBS_LAG = DISSEMINATION_LAG["NBS"]
 _TICKER_RE = re.compile(r"^(KXHIGH\w+)-(\d{2}[A-Z]{3}\d{2})-([TB])([\d.]+)$")
 
-ERROR_LOOKBACK = 10
+ERROR_LOOKBACK = 180
 MAX_LEAD_MISMATCH_HOURS = 3
 
 
@@ -55,16 +55,29 @@ def parse_ticker(ticker):
     return Contract(ticker, series, td, ctype, float(val))
 
 
+def build_nbs_index(nbs_rows):
+    """Index NBS rows by ftime for fast lookup: {ftime: [(runtime_str, txn)]}"""
+    idx = defaultdict(list)
+    for rt_str, ft_str, txn in nbs_rows:
+        if txn is not None:
+            idx[ft_str].append((rt_str, txn))
+    return dict(idx)
+
+
 def get_errors_at_lead(nbs_rows, metar_data, station, target_date,
-                       current_runtime):
+                       current_runtime, obs_highs=None, nbs_index=None):
     td = datetime.strptime(target_date, "%Y-%m-%d")
     target_ftime = (td + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     runtime_dt = datetime.fromisoformat(current_runtime.replace("Z", "+00:00"))
     ftime_dt = datetime.fromisoformat(target_ftime.replace("Z", "+00:00"))
     lead = ftime_dt - runtime_dt
 
+    # Build index if not provided
+    if nbs_index is None:
+        nbs_index = build_nbs_index(nbs_rows)
+
     errors = []
-    for days_back in range(1, ERROR_LOOKBACK + 15):
+    for days_back in range(1, ERROR_LOOKBACK + 30):
         if len(errors) >= ERROR_LOOKBACK:
             break
         past_date = (td - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -73,11 +86,14 @@ def get_errors_at_lead(nbs_rows, metar_data, station, target_date,
         ideal_rt = (datetime.fromisoformat(
             past_ftime.replace("Z", "+00:00")) - lead)
 
+        # Fast lookup by ftime
+        candidates = nbs_index.get(past_ftime)
+        if not candidates:
+            continue
+
         best_txn = None
         best_diff = float("inf")
-        for rt_str, ft_str, txn in nbs_rows:
-            if ft_str != past_ftime or txn is None:
-                continue
+        for rt_str, txn in candidates:
             rt_dt = datetime.fromisoformat(rt_str.replace("Z", "+00:00"))
             diff = abs((rt_dt - ideal_rt).total_seconds())
             if diff < best_diff:
@@ -87,14 +103,22 @@ def get_errors_at_lead(nbs_rows, metar_data, station, target_date,
         if best_txn is None or best_diff > MAX_LEAD_MISMATCH_HOURS * 3600:
             continue
 
-        obs_temps = metar_data.get(station)
-        if not obs_temps: continue
-        day_temps = [t for ot, t in obs_temps
-                     if ot >= past_date + "T00:00:00Z"
-                     and ot < past_next + "T00:00:00Z" and t is not None]
-        if not day_temps: continue
+        obs_val = None
+        if obs_highs:
+            obs_val = obs_highs.get((station, past_date))
+        if obs_val is None:
+            obs_temps = metar_data.get(station)
+            if obs_temps:
+                day_temps = [t for ot, t in obs_temps
+                             if ot >= past_date + "T00:00:00Z"
+                             and ot < past_next + "T00:00:00Z"
+                             and t is not None]
+                if day_temps:
+                    obs_val = max(day_temps)
+        if obs_val is None:
+            continue
 
-        errors.append(max(day_temps) - best_txn)
+        errors.append(obs_val - best_txn)
     return errors
 
 
@@ -148,11 +172,15 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
     nbs_raw = conn.execute(
         f"SELECT station, runtime, ftime, txn FROM iem_forecasts "
         f"WHERE model='NBS' AND station IN ({ph}) "
-        f"AND runtime >= '2026-03-20' ORDER BY station, runtime",
+        f"ORDER BY station, runtime",
         active).fetchall()
     nbs_by_stn = defaultdict(list)
     for stn, rt, ft, txn in nbs_raw:
         nbs_by_stn[stn].append((rt, ft, txn))
+
+    # Precompute ftime index per station for fast error lookups
+    nbs_idx = {stn: build_nbs_index(rows)
+               for stn, rows in nbs_by_stn.items()}
 
     metar_raw = conn.execute(
         f"SELECT station, obs_time, temp_f FROM metar_obs "
@@ -161,13 +189,28 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
     for stn, ot, tf in metar_raw:
         metar_data[stn].append((ot, tf))
 
-    obs_lookup = {}
+    # Load observed_highs (has 6 months of history)
+    obs_highs = {}
+    try:
+        oh_raw = conn.execute(
+            f"SELECT station, date, max_tmpf FROM observed_highs "
+            f"WHERE station IN ({ph})", active).fetchall()
+        for stn, d, t in oh_raw:
+            if t is not None:
+                obs_highs[(stn, d)] = t
+        print(f"  {len(obs_highs)} observed highs loaded")
+    except sqlite3.OperationalError:
+        pass
+
+    # Settlement lookup: observed_highs first, then METAR
+    obs_lookup = dict(obs_highs)
     for stn in active:
         by_day = defaultdict(list)
         for ot, tf in metar_data.get(stn, []):
             if tf is not None: by_day[ot[:10]].append(tf)
         for d, tl in by_day.items():
-            obs_lookup[(stn, d)] = max(tl)
+            if (stn, d) not in obs_lookup:
+                obs_lookup[(stn, d)] = max(tl)
 
     snapshots = [r[0] for r in conn.execute(
         "SELECT DISTINCT ts FROM kalshi_prices ORDER BY ts").fetchall()]
@@ -230,7 +273,9 @@ def run(fixed_edge=None, fixed_cost=None, max_pos=5):
                 continue
 
             errors = get_errors_at_lead(
-                nbs_by_stn[icao], metar_data, icao, td, runtime)
+                nbs_by_stn[icao], metar_data, icao, td, runtime,
+                obs_highs=obs_highs,
+                nbs_index=nbs_idx.get(icao))
             if not errors:
                 continue
 
